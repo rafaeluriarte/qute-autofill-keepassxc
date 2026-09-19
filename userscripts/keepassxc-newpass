@@ -1,0 +1,830 @@
+#!/usr/bin/env python3
+"""qutebrowser userscript: generate + SAVE + fill a new password.
+
+On a sign-up / change-password form: generate a strong password (preferring
+KeePassXC's own `keepassxc-cli generate`, falling back to Python `secrets`
+only if that's unavailable or fails), SAVE it to KeePassXC first via the
+browser-integration protocol's `set-login` action, and only after that save
+is confirmed successful, fill it into the page.
+
+Usage (see ~/.config/qutebrowser/config.py for a suggested `pn` binding -
+check it doesn't collide with an existing binding before adding it):
+
+    :spawn --userscript keepassxc-newpass --key YOUR_GPG_KEY_ID
+    :spawn --userscript keepassxc-newpass --key YOUR_GPG_KEY_ID --length 20
+    :spawn --userscript keepassxc-newpass --key YOUR_GPG_KEY_ID --dry-run
+
+Pass the SAME --key as the `pw`/`pT` bindings
+(`spawn --userscript keepassxc-login --key YOUR_GPG_KEY_ID[...]`, itself
+built on the same, unmodified qute-keepassxc) so this script decrypts the
+SAME GPG-encrypted association-key file ($QUTE_DATA_DIR/keepassxc.key.gpg)
+qute-keepassxc already created - i.e. the existing association is reused
+and the user never has to re-associate.
+
+Reuse of qute-keepassxc
+------------------------
+This script does not reimplement the KeePassXC browser-protocol handshake.
+It loads ~/.local/share/qutebrowser/userscripts/qute-keepassxc as a module
+(via importlib, since it has no .py extension and is not meant to be
+modified) and reuses, verbatim and unmodified:
+
+  - qkpxc.KeepassXC       the NaCl-box protocol client (change-public-keys,
+                           test-associate, associate, get-logins, get-totp)
+  - qkpxc.SecretKeyStore  the GPG-encrypted (or plaintext with --insecure)
+                           association-key store, keyed by $QUTE_DATA_DIR
+  - qkpxc.connect_to_keepassxc(args)
+                           the connect-or-associate-then-connect flow
+
+qute-keepassxc's KeepassXC class has no `set-login` action (it is a
+read-only "fetch credentials" client), so this script attaches one as an
+extra bound method on the already-connected instance at runtime
+(`kp.set_login = types.MethodType(_set_login, kp)`) rather than editing
+qute-keepassxc. The request/response shape of `set-login` was reverse
+engineered empirically against a real, isolated KeePassXC instance (see the
+test suite and the accompanying report); it is not documented in
+qute-keepassxc itself.
+
+The importlib loader for qute-keepassxc, the qutebrowser-FIFO plumbing
+(qb_quote/fifo_send/message_info/message_error/_dump_one_line), and the
+domain-widening lookup cascade used both for the existing-entry/duplicate
+check below and by the sibling `keepassxc-login` userscript all live in
+the shared ~/.local/share/qutebrowser/userscripts/kpxc_lookup.py module
+now (imported below as `kl`) instead of being duplicated here.
+
+Copyright note: the reused class/functions are (c) 2018-2021 Markus Blöchl,
+MIT licensed, from qute-keepassxc; everything else in this file is new.
+
+Testing / privacy overrides (env vars; all optional, all default to the
+real paths so normal interactive use needs none of them)
+----------------------------------------------------------------------
+  QUTE_KEEPASSXC_SOCKET   overrides the KeePassXC browser-protocol socket
+                           path (default: /run/user/<uid>/org.keepassxc.
+                           KeePassXC.BrowserServer, same default as
+                           qute-keepassxc); also settable via --socket.
+  QUTE_KEEPASSXC_CLI      overrides the `keepassxc-cli` executable used for
+                           password generation; also settable via
+                           --cli-path.
+  QUTE_DATA_DIR           (already set by qutebrowser itself) - where the
+                           association-key file lives; point it at a temp
+                           dir in tests so the real one is never touched.
+  QUTE_CONFIG_DIR         (already set by qutebrowser itself, and already
+                           honoured the same way by the sibling `autofill`
+                           userscript) - where autofill/profiles.toml lives.
+  QUTE_KEEPASSXC_ALIASES_DIR
+                           overrides where kpxc_lookup's alias store
+                           (aliases.json - see keepassxc-login) lives; the
+                           lookup cascade used for the existing-entry/
+                           duplicate check below reads it.
+
+profiles.toml contains REAL personal data (email, username): it is read
+here only at the moment a login default is needed, its values are never
+printed, logged, or written anywhere else, and --dry-run deliberately does
+NOT print the login value it would use.
+"""
+
+import argparse
+import base64
+import os
+import re
+import secrets
+import shutil
+import socket as socket_module
+import string
+import subprocess
+import sys
+import tomllib
+import types
+from html.parser import HTMLParser
+from pathlib import Path
+from types import SimpleNamespace
+from urllib.parse import urlparse
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+sys.path.insert(0, str(SCRIPT_DIR))
+import kpxc_lookup as kl  # noqa: E402
+
+qb_quote = kl.qb_quote
+fifo_send = kl.fifo_send
+message_info = kl.message_info
+message_error = kl.message_error
+_dump_one_line = kl._dump_one_line
+load_qute_keepassxc = kl.load_qute_keepassxc
+
+DEFAULT_LENGTH = 14
+# Conservative symbol whitelist: common on password-policy allow-lists and
+# safe to embed in JSON/JS without any escaping surprises. keepassxc-cli's
+# own -s/--special charset is effectively all of string.punctuation; when we
+# ask it for symbols we exclude everything outside this set with -x so the
+# generated password stays inside this conservative set even when the CLI
+# does the generating.
+CONSERVATIVE_SYMBOLS = "!@#$%^&*-_=+.,?~"
+_EXCLUDED_SYMBOLS = "".join(sorted(set(string.punctuation) - set(CONSERVATIVE_SYMBOLS)))
+
+# Characters that look alike in many fonts (matches keepassxc-cli's own
+# --exclude-similar intent) - used by the Python `secrets` fallback so its
+# output is comparable to keepassxc-cli's with --exclude-similar.
+AMBIGUOUS_CHARS = set("il1IlLo0O")
+
+DEFAULT_MAX_ATTEMPTS = 40  # per character-class level, only spent when a pattern must be matched
+DEFAULT_SAVE_TIMEOUT = 60.0  # seconds to wait for KeePassXC to confirm set-login (it may show a dialog)
+
+
+# qutebrowser FIFO plumbing (qb_quote/fifo_send/message_info/message_error/
+# _dump_one_line) and the qute-keepassxc module loader (load_qute_keepassxc)
+# now live in kpxc_lookup.py (imported as kl above) and are aliased at
+# module scope above so the rest of this file is unchanged.
+
+
+def _set_login(self, url, login, password, submit_url=None, group=None, uuid=None):
+    """set-login action, attached onto a connected qkpxc.KeepassXC instance.
+
+    Not implemented by qute-keepassxc (it's a read-only client), so this is
+    bound as an extra method at runtime instead of editing that file.
+
+    Wire format confirmed two ways:
+      1. Empirically, against a real, isolated KeePassXC 2.7.12 instance
+         (see the test suite / report for the exact request/response
+         observed there - that pass did not exercise `uuid` update-in-place,
+         which duplicated entries instead of updating them).
+      2. Against the official keepassxc-browser browser-extension source
+         (~/.var/app/com.google.Chrome/config/google-chrome/Default/
+         Extensions/oboonakemofpalcgghocfoadofidjkkk/<version>/background/
+         keepass.js, function `keepass.updateCredentials`): it sends the
+         exact same fields (action/id/login/password/url/submitUrl[/group/
+         groupUuid]) and additionally sets `messageData.uuid = entryId`
+         *only* when updating an existing entry (entryId truthy); uuid is
+         omitted entirely to create a new entry - which is exactly what
+         `uuid=None` (skip the key) below does. That function also confirms
+         the response's `error` field is `'success'` (or, on older KeePassXC,
+         `''`) on success for this specific action.
+    """
+    msg = dict(
+        action="set-login",
+        url=url,
+        submitUrl=submit_url or url,
+        id=self.id,
+        login=login,
+        password=password,
+        key=base64.b64encode(self.id_key.public_key.encode()).decode("utf-8"),
+    )
+    if group:
+        msg["group"] = group
+    if uuid:
+        msg["uuid"] = uuid
+    self.send_msg(msg)
+    return self.recv_msg()
+
+
+# ---------------------------------------------------------------------------
+# Avoiding duplicate entries: look up existing entries for this URL/login
+# ---------------------------------------------------------------------------
+
+def find_matching_entries(kp, url, login, alias_term=None):
+    """Entries found via kpxc_lookup's cascade whose login matches (case-insensitive).
+
+    Uses the same domain-widening cascade as keepassxc-login (kl.lookup)
+    rather than a single exact get-logins(url) call, so a signup/change
+    -password form on a page whose entry actually lives at the origin, a
+    parent domain, or a remembered alias is still recognised as a
+    duplicate instead of silently creating a second entry there.
+
+    Note: KeePassXC only returns entries it is willing to expose to this
+    connection via get-logins; an entry this same script created a moment
+    ago via set-login is not guaranteed to come back here (observed
+    empirically against a real instance) - so this lookup can under-report
+    matches. When it does, the practical effect is just a duplicate entry
+    (the pre-existing behaviour), not a wrong password ending up saved.
+    """
+    try:
+        _matched_url, entries = kl.lookup(kp, url, alias_term)
+    except Exception:
+        # get-logins failing (e.g. KeepassError, socket hiccup) must not
+        # abort the save flow - fall back to "no known matches" (create).
+        entries = []
+    return [e for e in (entries or []) if (e.get("login") or "").lower() == login.lower()]
+
+
+def prompt_update_or_create(host, login):
+    """rofi: single existing match found - update it, or create a new entry?
+
+    Pre-highlighted/first option is "update" (rofi highlights the first
+    list entry by default), matching the requested default. Escape cancels.
+    """
+    options = [f"update existing entry for {login}", "create new entry"]
+    try:
+        proc = subprocess.run(
+            ["rofi", "-dmenu", "-p", f"keepassxc-newpass: entry exists for {host}"],
+            input="\n".join(options) + "\n", capture_output=True, text=True, check=False,
+        )
+    except FileNotFoundError:
+        message_error("keepassxc-newpass: rofi is not installed - defaulting to update")
+        return "update"
+    if proc.returncode != 0:
+        return None  # Escape / cancelled
+    choice = proc.stdout.strip()
+    if choice == options[0]:
+        return "update"
+    if choice == options[1]:
+        return "create"
+    return None  # unrecognised/custom text typed - treat as cancel, never guess
+
+
+def prompt_pick_entry(host, login, matches):
+    """rofi: multiple existing matches - pick one to update, or create new.
+
+    Returns a uuid to update, '__create__', or None (cancel/unrecognised).
+    """
+    create_label = "create new entry"
+    label_to_uuid = {}
+    lines = []
+    for i, e in enumerate(matches):
+        uuid = e.get("uuid") or ""
+        label = f"update: {e.get('name') or e.get('login') or ('entry ' + str(i + 1))} [{uuid[:8]}]"
+        label_to_uuid[label] = uuid
+        lines.append(label)
+    lines.append(create_label)
+    try:
+        proc = subprocess.run(
+            ["rofi", "-dmenu", "-p", f"keepassxc-newpass: {len(matches)} entries for {login} on {host}"],
+            input="\n".join(lines) + "\n", capture_output=True, text=True, check=False,
+        )
+    except FileNotFoundError:
+        message_error("keepassxc-newpass: rofi is not installed")
+        return None  # ambiguous - never guess which entry to overwrite
+    if proc.returncode != 0:
+        return None
+    choice = proc.stdout.strip()
+    if choice == create_label:
+        return "__create__"
+    return label_to_uuid.get(choice) or None
+
+
+# ---------------------------------------------------------------------------
+# Parsing password-field constraints out of $QUTE_HTML
+# ---------------------------------------------------------------------------
+
+class _InputCollector(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.inputs = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() == "input":
+            d = {k.lower(): (v if v is not None else "") for k, v in attrs}
+            self.inputs.append(d)
+
+
+def parse_password_fields(html_text: str) -> dict:
+    """Extract new-password field constraints from a page's HTML dump.
+
+    $QUTE_HTML is a live DOM serialization (QtWebEngine's page().toHtml(),
+    called by qutebrowser before spawning any userscript - see
+    qutebrowser/commands/userscripts.py's store_html()/run_async() and
+    webenginetab.py's dump_async()), not the original network response, so
+    this reflects JS-rendered forms too.
+    """
+    parser = _InputCollector()
+    try:
+        parser.feed(html_text or "")
+    except Exception:
+        pass
+
+    inputs = parser.inputs
+
+    def is_password(i):
+        return i.get("type", "text").lower() == "password"
+
+    def tokens(i, attr):
+        return (i.get(attr, "") or "").lower().split()
+
+    pw_fields = [i for i in inputs if is_password(i)]
+    current_pw = [i for i in pw_fields if "current-password" in tokens(i, "autocomplete")]
+    new_pw = [i for i in pw_fields if i not in current_pw]
+    explicit_new = [i for i in new_pw if "new-password" in tokens(i, "autocomplete")]
+    target = (explicit_new or new_pw or pw_fields or [{}])[0]
+
+    def to_int(v):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+
+    return {
+        "minlength": to_int(target.get("minlength")),
+        "maxlength": to_int(target.get("maxlength")),
+        "pattern": target.get("pattern") or None,
+        "passwordrules": target.get("passwordrules") or target.get("data-passwordrules") or None,
+        "has_new_password_field": bool(new_pw),
+        "has_current_password_field": bool(current_pw),
+        "has_confirm_pair": len(new_pw) >= 2,
+        "password_field_count": len(pw_fields),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Password generation
+# ---------------------------------------------------------------------------
+
+ALL_CLASSES = frozenset({"lower", "upper", "digit", "special"})
+_DROP_ORDER = ["special", "digit", "upper"]  # order in which classes are dropped as a last resort
+
+
+def clamp_length(requested: int, minlength, maxlength) -> int:
+    length = requested
+    if maxlength is not None and maxlength > 0:
+        length = min(length, maxlength)
+    if minlength is not None and minlength > 0:
+        length = max(length, minlength)
+    if maxlength is not None and maxlength > 0:
+        length = min(length, maxlength)  # maxlength wins if it conflicts with minlength
+    return max(length, 1)
+
+
+def parse_password_rules(rules_str):
+    """Parse (a practical subset of) Apple's `passwordrules` attribute format.
+
+    e.g. "minlength: 8; maxlength: 20; required: upper, lower, digit, special;"
+    Unsupported directives (allowed, max-consecutive, ...) are ignored.
+    """
+    result = {"minlength": None, "maxlength": None, "required": None}
+    if not rules_str:
+        return result
+    name_map = {
+        "upper": "upper", "uppercase": "upper",
+        "lower": "lower", "lowercase": "lower",
+        "digit": "digit", "digits": "digit", "number": "digit", "numeric": "digit",
+        "special": "special", "symbol": "special", "special-characters": "special",
+    }
+    for directive in rules_str.split(";"):
+        directive = directive.strip()
+        if not directive or ":" not in directive:
+            continue
+        key, _, value = directive.partition(":")
+        key = key.strip().lower()
+        value = value.strip()
+        if key == "minlength":
+            try:
+                result["minlength"] = int(value)
+            except ValueError:
+                pass
+        elif key == "maxlength":
+            try:
+                result["maxlength"] = int(value)
+            except ValueError:
+                pass
+        elif key == "required":
+            req = set()
+            for part in value.split(","):
+                part = part.strip().lower()
+                if part in name_map:
+                    req.add(name_map[part])
+            if req:
+                result["required"] = req
+    return result
+
+
+def _class_fallback_sequence(required):
+    """[required, required-minus-special, ...-digit, ...-upper], never empty."""
+    current = set(required) or set(ALL_CLASSES)
+    seq = [frozenset(current)]
+    for cls in _DROP_ORDER:
+        if cls in current and len(current) > 1:
+            current = current - {cls}
+            seq.append(frozenset(current))
+    return seq
+
+
+def build_keepassxc_cli_args(length, classes, exclude_similar=True, extra_exclude=""):
+    """Build the argv tail (after the 'keepassxc-cli' executable) for `generate`."""
+    args = ["generate", "-q", "-L", str(length)]
+    if "lower" in classes:
+        args.append("-l")
+    if "upper" in classes:
+        args.append("-U")
+    if "digit" in classes:
+        args.append("-n")
+    if "special" in classes:
+        args.append("-s")
+    if len(classes) > 1:
+        args.append("--every-group")
+    exclude = extra_exclude or ""
+    if "special" in classes:
+        exclude += _EXCLUDED_SYMBOLS
+    if exclude:
+        seen = set()
+        exclude = "".join(c for c in exclude if not (c in seen or seen.add(c)))
+        args += ["-x", exclude]
+    if exclude_similar:
+        args.append("--exclude-similar")
+    return args
+
+
+def run_keepassxc_cli_generate(argv_tail, cli_path="keepassxc-cli", timeout=5):
+    """Run `<cli_path> <argv_tail>`, return the generated password or None on any failure.
+
+    Never logs the password. Returns None (not an exception) for "this
+    combination of length/classes isn't achievable" (keepassxc-cli exits 1
+    with 'Invalid password generator after applying all options' e.g. for
+    length below what 4 character classes need), a missing binary, or a
+    timeout - the caller is expected to try a smaller class set instead.
+    """
+    try:
+        proc = subprocess.run(
+            [cli_path] + argv_tail, capture_output=True, text=True, timeout=timeout,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    pw = proc.stdout.rstrip("\r\n")
+    return pw or None
+
+
+def _secrets_charset(cls, exclude_similar):
+    base = {
+        "lower": string.ascii_lowercase,
+        "upper": string.ascii_uppercase,
+        "digit": string.digits,
+        "special": CONSERVATIVE_SYMBOLS,
+    }[cls]
+    if exclude_similar and cls != "special":
+        base = "".join(c for c in base if c not in AMBIGUOUS_CHARS)
+    return base
+
+
+def generate_with_python_secrets(length, classes, exclude_similar=True):
+    classes = sorted(classes)  # stable order, doesn't affect security (still secrets.choice/shuffled)
+    pools = {c: _secrets_charset(c, exclude_similar) for c in classes}
+    all_chars = "".join(pools.values())
+    if not all_chars:
+        raise ValueError("no character classes selected")
+    required_chars = [secrets.choice(pools[c]) for c in classes]
+    if len(required_chars) > length:
+        required_chars = required_chars[:length]
+    rest = [secrets.choice(all_chars) for _ in range(max(length - len(required_chars), 0))]
+    pwd_chars = required_chars + rest
+    for i in range(len(pwd_chars) - 1, 0, -1):
+        j = secrets.randbelow(i + 1)
+        pwd_chars[i], pwd_chars[j] = pwd_chars[j], pwd_chars[i]
+    return "".join(pwd_chars)
+
+
+def generate_password(
+    *,
+    requested_length=DEFAULT_LENGTH,
+    minlength=None,
+    maxlength=None,
+    pattern=None,
+    passwordrules=None,
+    cli_path="keepassxc-cli",
+    max_attempts=DEFAULT_MAX_ATTEMPTS,
+    exclude_similar=True,
+):
+    """Generate a password honouring field constraints.
+
+    Prefers `keepassxc-cli generate`; falls back to Python `secrets` only if
+    the CLI is missing or fails outright (never as the default path).
+    Returns (password, meta) where meta has at least 'source' and 'length'.
+    """
+    rules = parse_password_rules(passwordrules)
+    eff_min = minlength
+    eff_max = maxlength
+    if rules["minlength"] is not None:
+        eff_min = max(eff_min or 0, rules["minlength"])
+    if rules["maxlength"] is not None:
+        eff_max = rules["maxlength"] if eff_max is None else min(eff_max, rules["maxlength"])
+    length = clamp_length(requested_length, eff_min, eff_max)
+
+    base_required = rules["required"] or set(ALL_CLASSES)
+    class_sequence = _class_fallback_sequence(base_required)
+
+    cli_available = shutil.which(cli_path) is not None
+
+    if cli_available:
+        for classes in class_sequence:
+            attempts = max_attempts if pattern else 1
+            for _ in range(attempts):
+                argv = build_keepassxc_cli_args(length, classes, exclude_similar=exclude_similar)
+                pw = run_keepassxc_cli_generate(argv, cli_path)
+                if pw is None:
+                    break  # this class combo isn't achievable at this length; try fewer classes
+                if not pattern or re.fullmatch(pattern, pw):
+                    return pw, {"source": "keepassxc-cli", "classes": sorted(classes), "length": length}
+
+    # Fallback: Python `secrets` (cli missing, or cli failed / never matched pattern)
+    fallback_suffix = "" if cli_available else " (keepassxc-cli unavailable)"
+    for classes in class_sequence:
+        attempts = max_attempts if pattern else 1
+        for _ in range(attempts):
+            pw = generate_with_python_secrets(length, classes, exclude_similar=exclude_similar)
+            if not pattern or re.fullmatch(pattern, pw):
+                return pw, {
+                    "source": "python-secrets" + fallback_suffix,
+                    "classes": sorted(classes),
+                    "length": length,
+                }
+
+    # Last resort: alnum-only, accepted even if `pattern` still doesn't match.
+    alnum_classes = {c for c in ("lower", "upper", "digit") if c in base_required} or {"lower", "upper", "digit"}
+    pw = generate_with_python_secrets(length, alnum_classes, exclude_similar=exclude_similar)
+    return pw, {
+        "source": "python-secrets-fallback-alnum" + fallback_suffix,
+        "classes": sorted(alnum_classes),
+        "length": length,
+        "warning": "pattern not confirmed after bounded attempts" if pattern else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Login: profile default + rofi confirmation
+# ---------------------------------------------------------------------------
+
+def load_login_profile_default():
+    """Read ~/.config/qutebrowser/autofill/profiles.toml's default profile's
+    username (else email). Never prints/logs the value; returns None quietly
+    on any error (missing file, bad TOML, no default, ...).
+    """
+    config_dir = Path(os.environ.get("QUTE_CONFIG_DIR") or os.path.expanduser("~/.config/qutebrowser"))
+    profiles_path = config_dir / "autofill" / "profiles.toml"
+    if not profiles_path.exists():
+        return None
+    try:
+        with open(profiles_path, "rb") as f:
+            data = tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+    profiles = data.get("profiles", {})
+    name = data.get("default")
+    profile = profiles.get(name, {}) if name else {}
+    return profile.get("username") or profile.get("email") or None
+
+
+def prompt_login(host, default_login):
+    """rofi -dmenu prompt, prefilled/selectable with default_login; Escape cancels.
+
+    Returns the chosen/typed login, or None if the user cancelled (or typed
+    nothing and there was no default).
+    """
+    args = ["rofi", "-dmenu", "-p", f"login for {host}"]
+    stdin_text = ""
+    if default_login:
+        args += ["-filter", default_login]
+        stdin_text = default_login + "\n"
+    try:
+        proc = subprocess.run(args, input=stdin_text, capture_output=True, text=True, check=False)
+    except FileNotFoundError:
+        message_error("keepassxc-newpass: rofi is not installed")
+        return default_login or None
+    if proc.returncode != 0:
+        return None  # Escape / cancelled
+    value = proc.stdout.strip()
+    return value or default_login or None
+
+
+# ---------------------------------------------------------------------------
+# Filling the page (isolated jseval world, native setter + bubbling events)
+# ---------------------------------------------------------------------------
+
+def build_fill_js(login: str, password: str) -> str:
+    template = """
+        (function () {
+            function isVisible(el) {
+                if (!el || !el.isConnected) return false;
+                var win = el.ownerDocument.defaultView;
+                var cs = win.getComputedStyle(el);
+                if (cs.visibility === "hidden" || cs.display === "none" || cs.opacity === "0") return false;
+                var r = el.getBoundingClientRect();
+                return r.width > 0 && r.height > 0;
+            }
+            function tokens(el) {
+                return (el.getAttribute("autocomplete") || "").toLowerCase().split(/\\s+/);
+            }
+            function nativeSetter(el) {
+                var proto = el.tagName === "SELECT" ? window.HTMLSelectElement.prototype
+                    : el.tagName === "TEXTAREA" ? window.HTMLTextAreaElement.prototype
+                    : window.HTMLInputElement.prototype;
+                var d = Object.getOwnPropertyDescriptor(proto, "value");
+                return d && d.set;
+            }
+            function setVal(el, v) {
+                var setter = nativeSetter(el);
+                if (setter) setter.call(el, v); else el.value = v;
+                el.dispatchEvent(new Event("input", { bubbles: true }));
+                el.dispatchEvent(new Event("change", { bubbles: true }));
+            }
+            var PASSWORD = %s;
+            var LOGIN = %s;
+            var inputs = Array.prototype.slice.call(document.querySelectorAll("input"));
+            var pwFields = inputs.filter(function (el) { return el.type === "password" && isVisible(el); });
+            var currentPw, newPw;
+            if (pwFields.some(function (el) { return tokens(el).indexOf("current-password") !== -1; })) {
+                currentPw = pwFields.filter(function (el) { return tokens(el).indexOf("current-password") !== -1; });
+                newPw = pwFields.filter(function (el) { return currentPw.indexOf(el) === -1; });
+            } else if (pwFields.length === 3) {
+                currentPw = [pwFields[0]];
+                newPw = pwFields.slice(1);
+            } else {
+                currentPw = [];
+                newPw = pwFields;
+            }
+            if (newPw.length === 0) {
+                return "keepassxc-newpass: no new-password field found, nothing filled";
+            }
+            newPw.forEach(function (el) { setVal(el, PASSWORD); });
+            function isLoginType(el) {
+                return isVisible(el) && (el.type === "email" || el.type === "text" || el.type === "");
+            }
+            var loginField = inputs.find(function (el) {
+                var t = tokens(el);
+                return isLoginType(el) && (t.indexOf("username") !== -1 || t.indexOf("email") !== -1);
+            });
+            if (!loginField) {
+                var idx = inputs.indexOf(newPw[0]);
+                for (var i = idx - 1; i >= 0 && !loginField; i--) { if (isLoginType(inputs[i])) loginField = inputs[i]; }
+                for (var j = idx + 1; j < inputs.length && !loginField; j++) { if (isLoginType(inputs[j])) loginField = inputs[j]; }
+            }
+            if (loginField) setVal(loginField, LOGIN);
+            return "keepassxc-newpass: filled " + newPw.length + " password field(s)" + (loginField ? " and the login field" : "");
+        })()
+    """
+    return " ".join(template.splitlines()) % (_dump_one_line(password), _dump_one_line(login))
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Generate, save to KeePassXC, then fill a new password")
+    parser.add_argument("url", nargs="?", default=os.environ.get("QUTE_URL"))
+    parser.add_argument("--length", type=int, default=DEFAULT_LENGTH,
+                         help=f"requested password length, clamped to the field's minlength/maxlength (default: {DEFAULT_LENGTH})")
+    parser.add_argument("--group", default=None, help="KeePassXC group to save the entry into")
+    parser.add_argument("--socket", "-s",
+                         default=os.environ.get("QUTE_KEEPASSXC_SOCKET",
+                                                 "/run/user/{}/org.keepassxc.KeePassXC.BrowserServer".format(os.getuid())),
+                         help="path to the KeePassXC browser-protocol socket")
+    parser.add_argument("--key", "-k", default="alice@example.com",
+                         help="GPG key the association key is encrypted with (pass the SAME key as the `pw` binding to reuse its association)")
+    parser.add_argument("--insecure", action="store_true", help="do not GPG-encrypt the association key file")
+    parser.add_argument("--cli-path", default=os.environ.get("QUTE_KEEPASSXC_CLI", "keepassxc-cli"),
+                         help="keepassxc-cli executable used for password generation")
+    parser.add_argument("--exclude-similar", dest="exclude_similar", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--save-timeout", type=float, default=DEFAULT_SAVE_TIMEOUT,
+                         help="seconds to wait for KeePassXC to confirm the save (it may show a confirmation dialog)")
+    parser.add_argument("--dry-run", action="store_true",
+                         help="print what would happen (constraints, login source, generated length) without saving or filling anything")
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+
+    if "QUTE_FIFO" not in os.environ and not args.dry_run:
+        print(f"No QUTE_FIFO found - {sys.argv[0]} must be run as a qutebrowser userscript "
+              "(or with --dry-run for manual testing)", file=sys.stderr)
+        return 1
+
+    if not args.url:
+        message_error("keepassxc-newpass: missing URL")
+        return 1
+
+    html_path = os.environ.get("QUTE_HTML")
+    html_text = ""
+    if html_path and os.path.exists(html_path):
+        with open(html_path, encoding="utf-8", errors="replace") as f:
+            html_text = f.read()
+
+    constraints = parse_password_fields(html_text)
+    if not constraints["has_new_password_field"]:
+        message_error("keepassxc-newpass: no new-password field found on this page")
+        return 1
+
+    pw, meta = generate_password(
+        requested_length=args.length,
+        minlength=constraints["minlength"],
+        maxlength=constraints["maxlength"],
+        pattern=constraints["pattern"],
+        passwordrules=constraints["passwordrules"],
+        cli_path=args.cli_path,
+        exclude_similar=args.exclude_similar,
+    )
+
+    host = urlparse(args.url).netloc or args.url
+    host_only = urlparse(args.url).hostname or host
+
+    if args.dry_run:
+        print(f"[dry-run] url: {args.url}")
+        print(f"[dry-run] host: {host}")
+        print(f"[dry-run] minlength={constraints['minlength']} maxlength={constraints['maxlength']}")
+        print(f"[dry-run] pattern={constraints['pattern']!r}")
+        print(f"[dry-run] passwordrules={constraints['passwordrules']!r}")
+        print(f"[dry-run] password_field_count={constraints['password_field_count']} "
+              f"has_current_password_field={constraints['has_current_password_field']} "
+              f"has_confirm_pair={constraints['has_confirm_pair']}")
+        print(f"[dry-run] generated password length={meta['length']} source={meta['source']} classes={meta.get('classes')}")
+        if meta.get("warning"):
+            print(f"[dry-run] warning: {meta['warning']}")
+        print("[dry-run] login: would come from profiles.toml's default profile / a rofi prompt (value not shown)")
+        print("[dry-run] nothing was saved to KeePassXC and nothing was filled")
+        return 0
+
+    default_login = load_login_profile_default()
+    login = prompt_login(host, default_login)
+    if not login:
+        message_info("keepassxc-newpass: cancelled")
+        return 0
+
+    qkpxc = load_qute_keepassxc()
+    ns = SimpleNamespace(key=(None if args.insecure else args.key), insecure=args.insecure, socket=args.socket)
+    try:
+        kp = qkpxc.connect_to_keepassxc(ns)
+    except qkpxc.KeepassError as e:
+        message_error(f"keepassxc-newpass: {e}")
+        return 1
+    if not kp:
+        # connect_to_keepassxc() already reported the specific reason via message-error
+        return 1
+    kp.set_login = types.MethodType(_set_login, kp)
+
+    # Avoid duplicate entries: look up existing entries for this URL whose
+    # login matches, and decide whether to update one in place (uuid) or
+    # create a new entry, per the policy in the module docstring's "Avoiding
+    # duplicate entries" section. Uses the same domain-widening cascade (and
+    # any remembered alias for this host) as keepassxc-login, so an entry
+    # that actually lives at the origin/a parent domain/an aliased site is
+    # still found instead of creating a duplicate.
+    target_uuid = None
+    alias_term = kl.get_alias(host_only) if host_only else None
+    matches = find_matching_entries(kp, args.url, login, alias_term=alias_term)
+    if len(matches) == 1:
+        if constraints["has_current_password_field"]:
+            target_uuid = matches[0].get("uuid")  # change-password form: update by default
+        else:
+            choice = prompt_update_or_create(host, login)
+            if choice is None:
+                message_info("keepassxc-newpass: cancelled")
+                return 0
+            if choice == "update":
+                target_uuid = matches[0].get("uuid")
+    elif len(matches) > 1:
+        chosen = prompt_pick_entry(host, login, matches)
+        if chosen is None:
+            message_info("keepassxc-newpass: cancelled")
+            return 0
+        if chosen != "__create__":
+            target_uuid = chosen
+
+    # Save with url=origin (scheme://host[:port]/) rather than the full page
+    # URL: KeePassXC's own get-logins matching only ever looks at
+    # scheme+host+port (see kpxc_lookup.py's module docstring), so a
+    # path-specific saved URL buys nothing and only makes this entry harder
+    # for the (equally path-insensitive) lookup cascade to associate with
+    # other pages on the same site later. submitUrl keeps the exact page
+    # URL, matching what qute-keepassxc's own keepass.updateCredentials
+    # reference sends it as.
+    parsed_page_url = urlparse(args.url)
+    port_part = f":{parsed_page_url.port}" if parsed_page_url.port else ""
+    save_url = f"{parsed_page_url.scheme}://{parsed_page_url.hostname}{port_part}/"
+
+    old_timeout = kp.sock.gettimeout()
+    kp.sock.settimeout(args.save_timeout)
+    try:
+        resp = kp.set_login(
+            url=save_url, login=login, password=pw, submit_url=args.url, group=args.group, uuid=target_uuid,
+        )
+    except socket_module.timeout:
+        message_error(
+            f"keepassxc-newpass: KeePassXC did not confirm the save within {args.save_timeout:.0f}s "
+            "(a confirmation dialog may be waiting) - nothing was filled"
+        )
+        return 1
+    except qkpxc.KeepassError as e:
+        message_error(f"keepassxc-newpass: save failed: {e}")
+        return 1
+    finally:
+        try:
+            kp.sock.settimeout(old_timeout)
+        except OSError:
+            pass
+
+    # KeePassXC's set-login reply puts 'error': 'success' in the *decrypted*
+    # payload even on success (verified empirically) - only 'success': 'true'
+    # is meaningful here; qkpxc.recv_msg() only raises on the outer,
+    # unencrypted 'error' field (protocol/association-level errors).
+    if resp.get("success") != "true":
+        message_error(f"keepassxc-newpass: save failed: {resp}")
+        return 1
+
+    js = build_fill_js(login, pw)
+    action_verb = "updated" if target_uuid else "saved new"
+    fifo_send(
+        f"jseval --quiet --world jseval {js}",
+        "message-info " + qb_quote(f"keepassxc: {action_verb} password and filled (login {login})"),
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

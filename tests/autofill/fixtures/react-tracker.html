@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>React-like tracker</title></head>
+<body>
+<h1>React-like value tracking fixture</h1>
+<p>
+  This page reimplements React's own input value-tracking trick
+  (react-dom/cjs/react-dom.development.js, inputValueTracking.trackValueOnNode):
+  it shadows each input's `value` property with an own-property accessor that
+  records the last value written *through that accessor*, then on a native
+  bubbling 'input' event compares the real (prototype-getter) value against
+  the recorded one. React only fires its synthetic onChange when they differ
+  -- which is exactly what happens when an external script (a password
+  manager, or this autofill userscript) sets .value via the *native* setter
+  obtained straight from the prototype descriptor, bypassing this instance
+  property. If autofill's isolated-world fill still trips this exact check,
+  it proves compatibility with real React forms, not just plain DOM ones.
+</p>
+<form id="f">
+  <input type="text" id="given" name="given" placeholder="First Name" autocomplete="given-name">
+  <input type="email" id="email" name="email" placeholder="Email" autocomplete="email">
+  <input type="tel" id="phone" name="phone" placeholder="Phone" autocomplete="tel">
+</form>
+<pre id="onchange-log"></pre>
+<script>
+(function () {
+  window.__onChangeEvents = [];
+  var trackers = new WeakMap();
+
+  function trackValueOnNode(node) {
+    var descriptor = Object.getOwnPropertyDescriptor(node.constructor.prototype, 'value') ||
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+    var currentValue = '' + node.value;
+    var get = descriptor.get, set = descriptor.set;
+    Object.defineProperty(node, 'value', {
+      configurable: true,
+      enumerable: descriptor.enumerable,
+      get: function () { return get.call(this); },
+      set: function (value) {
+        // A "real" (React-internal) write goes through here and keeps the
+        // tracker in sync -- exactly like typing in the field would.
+        currentValue = '' + value;
+        set.call(this, value);
+      },
+    });
+    return {
+      getValue: function () { return currentValue; },
+      setValue: function (value) { currentValue = '' + value; },
+    };
+  }
+
+  document.querySelectorAll('input').forEach(function (node) {
+    trackers.set(node, trackValueOnNode(node));
+  });
+
+  var nativeGetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').get;
+
+  // React attaches its change-detection listener at the document root, in
+  // the capture phase, on the native 'input' event.
+  document.addEventListener('input', function (e) {
+    var node = e.target;
+    var tracker = trackers.get(node);
+    if (!tracker) return;
+    var realValue = nativeGetter.call(node); // bypasses the instance accessor above
+    if (realValue !== tracker.getValue()) {
+      // This is the branch React's change-event plugin takes when a value
+      // changed WITHOUT going through the tracked setter -- i.e. it was set
+      // via the native prototype setter directly. React then fires its own
+      // synthetic onChange with the new value.
+      tracker.setValue(realValue);
+      var evt = { id: node.id, value: realValue, at: Date.now() };
+      window.__onChangeEvents.push(evt);
+      document.getElementById('onchange-log').textContent = JSON.stringify(window.__onChangeEvents, null, 2);
+      fetch('http://127.0.0.1:8765/', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ page: 'react-tracker-onchange', event: evt }),
+      }).catch(function () {});
+    }
+  }, true);
+})();
+</script>
+</body>
+</html>

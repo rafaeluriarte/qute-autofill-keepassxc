@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+"""Fake `rofi`: for keepassxc-login's account picker (-format i), always
+picks index 0 (the first/default entry). For a -filter text prompt (the
+"search which site?" prompt), echoes the prefilled default. Never sent
+a password: only used with keepassxc-login's own prompts."""
+import sys
+argv = sys.argv[1:]
+if "-filter" in argv:
+    print(argv[argv.index("-filter") + 1])
+elif "-format" in argv:
+    print("0")
+else:
+    lines = [line.rstrip("\n") for line in sys.stdin]
+    print(lines[0] if lines else "")
+sys.exit(0)

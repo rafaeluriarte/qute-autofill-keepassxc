@@ -1,0 +1,4 @@
+#!/usr/bin/env python3
+"""Fake `rofi`: simulates the user pressing Escape (cancel)."""
+import sys
+sys.exit(1)

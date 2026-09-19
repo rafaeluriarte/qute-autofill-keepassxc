@@ -1,0 +1,147 @@
+# qutebrowser autofill - profile definitions
+#
+# This file is read by the `autofill` userscript
+# (~/.local/share/qutebrowser/userscripts/autofill + autofill.js). It was
+# created as a TEMPLATE with obviously fake example data -- replace the
+# example values below with your own before using the `pf` / `pF` bindings.
+#
+# This file can contain personal data (name, address, tax IDs, ...), so it
+# is chmod 600 and its parent directory is chmod 700. Keep it that way.
+#
+# Usage:
+#   pf    fill the current page with the `default` profile below
+#   pF    pick a profile by name via a rofi menu, then fill with it
+#   :spawn --userscript autofill --profile NAME
+#   :spawn --userscript autofill --overwrite   (also replaces non-empty fields;
+#                                                default only fills empty ones)
+#
+# All fields are optional; empty/absent fields are simply left unfilled. Add
+# as many [profiles.NAME] sections as you like (e.g. "lavoro", "casa", ...).
+
+# Name of the profile used when neither --profile nor --choose is given.
+default = "italia"
+
+[profiles.italia]
+given_name = "Mario"
+family_name = "Rossi"
+# full_name is derived from given_name + family_name when left out.
+# full_name = "Mario Rossi"
+email = "mario.rossi@example.com"
+# International form, used for autocomplete="tel" / generic phone fields.
+phone = "+39 333 1234567"
+# National form, used when a field specifically wants a local number
+# (autocomplete="tel-national", or a short maxlength next to a separate
+# country-code selector). Falls back to `phone` when left out.
+phone_national = "333 1234567"
+organization = "Acme SRL"
+street = "Via Roma"
+house_number = "1"
+# Apartment/floor/suite ("complemento" in Brazilian Portuguese).
+address_line2 = ""
+# "Bairro" (BR) / neighbourhood -- rarely used on Italian forms.
+neighborhood = ""
+postal_code = "50100"
+city = "Firenze"
+# Full region/province name, and its short code -- <select> fields are
+# matched against either.
+province = "Firenze"
+province_code = "FI"
+# Canonical English country name; country_code is the ISO 3166-1 alpha-2 code.
+# Both are used to match <select> country dropdowns (in English, Italian or
+# Portuguese option text).
+country = "Italy"
+country_code = "IT"
+# ISO 8601 date. Quoted, so tomllib keeps it as a plain string rather than
+# parsing it into a TOML date object.
+birth_date = "1990-05-12"
+codice_fiscale = "RSSMRA90E12D612X"
+partita_iva = "12345678901"
+nif = ""
+cpf = ""
+vat = ""
+
+[profiles.portugal]
+given_name = "Joao"
+family_name = "Silva"
+email = "joao.silva@example.com"
+phone = "+351 912 345 678"
+phone_national = "912 345 678"
+organization = "Silva Lda"
+street = "Rua Augusta"
+house_number = "10"
+address_line2 = "2 Esq"
+neighborhood = "Baixa"
+# PT postal codes are "0000-000".
+postal_code = "1100-053"
+city = "Lisboa"
+province = "Lisboa"
+province_code = "Lisboa"
+country = "Portugal"
+country_code = "PT"
+birth_date = "1988-03-22"
+codice_fiscale = ""
+partita_iva = ""
+# NIF = Numero de Identificacao Fiscal (PT tax id).
+nif = "123456789"
+cpf = ""
+vat = "PT123456789"
+
+[profiles.brasil]
+given_name = "Joao"
+family_name = "Souza"
+email = "joao.souza@example.com"
+phone = "+55 11 91234-5678"
+phone_national = "(11) 91234-5678"
+organization = "Souza Ltda"
+street = "Avenida Paulista"
+house_number = "1000"
+address_line2 = "Apto 45"
+neighborhood = "Bela Vista"
+# BR CEP is "00000-000".
+postal_code = "01310-100"
+city = "Sao Paulo"
+# province_code here is the two-letter UF (state) used by <select> fields.
+province = "Sao Paulo"
+province_code = "SP"
+country = "Brazil"
+country_code = "BR"
+birth_date = "1995-11-30"
+codice_fiscale = ""
+partita_iva = ""
+nif = ""
+# CPF = Cadastro de Pessoas Fisicas (BR tax id).
+cpf = "123.456.789-09"
+vat = ""
+
+# ---------------------------------------------------------------------------
+# Per-site settings (optional). Keyed by hostname -- an exact host, or any
+# parent domain (e.g. "amazon.it" also matches "www.amazon.it" and
+# "checkout.amazon.it" when there is no more specific [sites.*] entry for
+# them). The MOST SPECIFIC match wins: an exact "checkout.amazon.it" entry
+# beats "amazon.it", which beats no entry at all. The host is read from
+# $QUTE_URL. --profile / --overwrite / --no-overwrite on the command line
+# always override the settings below; `skip` has no CLI equivalent (it is
+# site-only). All three keys in a [sites.*] block are optional.
+#
+#   profile     Profile name to use on this site instead of `default` above.
+#   overwrite   true/false -- same meaning as --overwrite/--no-overwrite.
+#   skip        List of field "kinds" (see below) to NEVER fill on this site,
+#               even if classify() would otherwise recognise the field.
+#
+# Field kind names usable in `skip` (these are exactly the values autofill.js
+# fills in from your profile -- see valueForKind() in
+# ~/.local/share/qutebrowser/userscripts/autofill.js):
+#   given_name, family_name, full_name, email, phone, phone_national,
+#   organization, street, house_number, address_line2, neighborhood,
+#   street_full, postal_code, city, province, province_code, country,
+#   country_code, birth_date, birth_day, birth_month, birth_year,
+#   codice_fiscale, partita_iva, nif, cpf, vat
+#
+# Example (commented out):
+# [sites."amazon.it"]
+# profile = "personal"
+# skip = ["phone", "birth_date"]
+# overwrite = true
+#
+# [sites."work.example.com"]
+# profile = "lavoro"

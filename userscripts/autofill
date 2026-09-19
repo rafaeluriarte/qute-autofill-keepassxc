@@ -1,0 +1,692 @@
+#!/usr/bin/env python3
+"""qutebrowser userscript: fill web forms from a local TOML profile.
+
+Usage (see ~/.config/qutebrowser/config.py for the `pf`/`pF` bindings):
+
+    :spawn --userscript autofill                    # fill with default profile
+    :spawn --userscript autofill --profile brasil    # fill with a named profile
+    :spawn --userscript autofill --choose            # pick a profile via rofi
+    :spawn --userscript autofill --overwrite         # also replace non-empty fields
+
+Profiles live in ~/.config/qutebrowser/autofill/profiles.toml (created here as
+a template, with obviously fake data, the first time this script runs and
+finds it missing). $QUTE_CONFIG_DIR is honoured instead of the hardcoded path
+when set (e.g. under `qutebrowser --basedir ...`), so this also works
+unmodified against an isolated test profile.
+
+How results are reported back to the user
+------------------------------------------
+Userscripts talk to qutebrowser by appending command lines to $QUTE_FIFO; they
+have no channel to *read* a value back out of the browser (there is no return
+path from `:jseval` to the spawning process). To still show a human-readable
+"N fields filled" message, we lean on `:jseval` itself: when it is *not*
+called with --quiet, qutebrowser's own jseval command already shows the
+JS completion value via `message.info()` -- the exact same function the
+`:message-info` command uses. So autofill.js's entry point computes and
+*returns* the final message string (e.g. "autofill: 7 fields filled (profile
+italia)"), and the second `:jseval` call below (no --quiet) is what ends up
+shown to the user. No second round trip or global-variable polling is needed.
+
+Privacy: isolated world, and no profile data ever touches disk
+----------------------------------------------------------------
+We run in `--world jseval`, qutebrowser's dedicated isolated JS world (the
+same one `:jseval` itself defaults to), NOT `--world main`. In the main
+world, a malicious page can monkeypatch builtins the page's own scripts and
+ours would share (JSON.stringify/parse, Object.getOwnPropertyDescriptor,
+EventTarget.prototype.dispatchEvent, the HTMLInputElement value setter, ...)
+and read the *entire* profile object as we hand it to QuteAutofill.run(),
+including fields the form never even asked for (codice_fiscale, cpf, nif,
+birth_date, ...). An isolated world gets its own pristine copies of those
+builtins -- the page cannot see or intercept calls we make through them --
+while DOM nodes themselves are still shared, so the native-setter-plus-
+bubbling-events fill technique still works and is framework-compatible; this
+is exactly how real browser extensions (e.g. password managers) autofill
+React/Vue/Angular forms from isolated content scripts. See
+autofill/tests/fixtures/react-tracker.html and monkeypatch-spy.html plus
+tests/e2e_test.py for the fixtures that prove both properties empirically.
+
+We send two separate `:jseval --world jseval` commands:
+  1. `jseval --file --world jseval <path to the installed autofill.js>` --
+     loads the (non-sensitive, static, never-changing) classifier/filler
+     library fresh into that isolated world. No profile data here at all, so
+     this is safe to read from a file (it always was just code).
+  2. `jseval --world jseval QuteAutofill.run({...profile...}, {...opts...}).summary`
+     -- a single physical line built directly with json.dumps() (which always
+     backslash-escapes control characters, so it can never itself contain a
+     raw newline) and sent straight over the FIFO. This is a valid JS object
+     literal (JSON is a syntactic subset of JS), so no JSON.parse is needed.
+     Nothing derived from the profile is ever written to disk: earlier
+     revisions of this script wrote a per-run temp .js file containing the
+     profile and deleted it a few seconds later, but avoiding the file
+     entirely is strictly better, and qutebrowser's IPC preserves the
+     ordering of same-frame runJavaScript calls issued back-to-back like
+     this (verified empirically across many runs; if it ever didn't hold,
+     step 2 would fail loudly with a ReferenceError, caught below and
+     reported as "autofill error: ...", not a silent wrong fill).
+
+`--world jseval` (vs. e.g. the "user" world, which is also isolated but is
+documented as "currently unused" by qutebrowser and has no other advantage
+here) was chosen because it is qutebrowser's own conventional world for
+exactly this kind of one-off script evaluation, and because both jseval calls
+in a single run need to land in the *same* isolated world so the second call
+can see the QuteAutofill global the first one just defined.
+"""
+
+import argparse
+import datetime
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import tomllib
+import unicodedata
+from pathlib import Path
+from urllib.parse import quote, urlparse
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+JS_SOURCE_PATH = SCRIPT_DIR / "autofill.js"
+MISS_RUNNER_PATH = SCRIPT_DIR / "autofill-lib" / "run-classify.js"
+
+CONFIG_DIR = Path(os.environ.get("QUTE_CONFIG_DIR") or os.path.expanduser("~/.config/qutebrowser"))
+AUTOFILL_DIR = CONFIG_DIR / "autofill"
+# AUTOFILL_PROFILES lets tests (and anyone else) point this script at a
+# throwaway profiles.toml full of fake data instead of the real one, without
+# touching QUTE_CONFIG_DIR (which also affects unrelated qutebrowser state
+# under --basedir). Unset (the normal case): the real per-user file.
+PROFILES_PATH = Path(os.environ["AUTOFILL_PROFILES"]) if os.environ.get("AUTOFILL_PROFILES") \
+    else AUTOFILL_DIR / "profiles.toml"
+
+# Misses ("learn from misses", requirement #5) live under the *data* dir
+# (~/.local/share/qutebrowser/autofill/), deliberately separate from
+# profiles.toml's *config* dir -- this is browsing-structure metadata, not
+# profile data, and QUTE_DATA_DIR (like QUTE_CONFIG_DIR) is honoured so this
+# also lands inside an isolated `--basedir` during tests.
+DATA_DIR = Path(os.environ.get("QUTE_DATA_DIR") or os.path.expanduser("~/.local/share/qutebrowser"))
+MISSES_DIR = DATA_DIR / "autofill"
+MISSES_PATH = MISSES_DIR / "misses.jsonl"
+
+FIFO_PATH = os.environ.get("QUTE_FIFO")
+
+TEMPLATE = '''\
+# qutebrowser autofill - profile definitions
+#
+# This file is read by the `autofill` userscript
+# (~/.local/share/qutebrowser/userscripts/autofill + autofill.js). It was
+# created as a TEMPLATE with obviously fake example data -- replace the
+# example values below with your own before using the `pf` / `pF` bindings.
+#
+# This file can contain personal data (name, address, tax IDs, ...), so it
+# is chmod 600 and its parent directory is chmod 700. Keep it that way.
+#
+# Usage:
+#   pf    fill the current page with the `default` profile below
+#   pF    pick a profile by name via a rofi menu, then fill with it
+#   :spawn --userscript autofill --profile NAME
+#   :spawn --userscript autofill --overwrite   (also replaces non-empty fields;
+#                                                default only fills empty ones)
+#
+# All fields are optional; empty/absent fields are simply left unfilled. Add
+# as many [profiles.NAME] sections as you like (e.g. "lavoro", "casa", ...).
+
+# Name of the profile used when neither --profile nor --choose is given.
+default = "italia"
+
+[profiles.italia]
+given_name = "Mario"
+family_name = "Rossi"
+# full_name is derived from given_name + family_name when left out.
+# full_name = "Mario Rossi"
+email = "mario.rossi@example.com"
+# International form, used for autocomplete="tel" / generic phone fields.
+phone = "+39 333 1234567"
+# National form, used when a field specifically wants a local number
+# (autocomplete="tel-national", or a short maxlength next to a separate
+# country-code selector). Falls back to `phone` when left out.
+phone_national = "333 1234567"
+organization = "Acme SRL"
+street = "Via Roma"
+house_number = "1"
+# Apartment/floor/suite ("complemento" in Brazilian Portuguese).
+address_line2 = ""
+# "Bairro" (BR) / neighbourhood -- rarely used on Italian forms.
+neighborhood = ""
+postal_code = "50100"
+city = "Firenze"
+# Full region/province name, and its short code -- <select> fields are
+# matched against either.
+province = "Firenze"
+province_code = "FI"
+# Canonical English country name; country_code is the ISO 3166-1 alpha-2 code.
+# Both are used to match <select> country dropdowns (in English, Italian or
+# Portuguese option text).
+country = "Italy"
+country_code = "IT"
+# ISO 8601 date. Quoted, so tomllib keeps it as a plain string rather than
+# parsing it into a TOML date object.
+birth_date = "1990-05-12"
+codice_fiscale = "RSSMRA90E12D612X"
+partita_iva = "12345678901"
+nif = ""
+cpf = ""
+vat = ""
+
+[profiles.portugal]
+given_name = "Joao"
+family_name = "Silva"
+email = "joao.silva@example.com"
+phone = "+351 912 345 678"
+phone_national = "912 345 678"
+organization = "Silva Lda"
+street = "Rua Augusta"
+house_number = "10"
+address_line2 = "2 Esq"
+neighborhood = "Baixa"
+# PT postal codes are "0000-000".
+postal_code = "1100-053"
+city = "Lisboa"
+province = "Lisboa"
+province_code = "Lisboa"
+country = "Portugal"
+country_code = "PT"
+birth_date = "1988-03-22"
+codice_fiscale = ""
+partita_iva = ""
+# NIF = Numero de Identificacao Fiscal (PT tax id).
+nif = "123456789"
+cpf = ""
+vat = "PT123456789"
+
+[profiles.brasil]
+given_name = "Joao"
+family_name = "Souza"
+email = "joao.souza@example.com"
+phone = "+55 11 91234-5678"
+phone_national = "(11) 91234-5678"
+organization = "Souza Ltda"
+street = "Avenida Paulista"
+house_number = "1000"
+address_line2 = "Apto 45"
+neighborhood = "Bela Vista"
+# BR CEP is "00000-000".
+postal_code = "01310-100"
+city = "Sao Paulo"
+# province_code here is the two-letter UF (state) used by <select> fields.
+province = "Sao Paulo"
+province_code = "SP"
+country = "Brazil"
+country_code = "BR"
+birth_date = "1995-11-30"
+codice_fiscale = ""
+partita_iva = ""
+nif = ""
+# CPF = Cadastro de Pessoas Fisicas (BR tax id).
+cpf = "123.456.789-09"
+vat = ""
+
+# ---------------------------------------------------------------------------
+# Per-site settings (optional). Keyed by hostname -- an exact host, or any
+# parent domain (e.g. "amazon.it" also matches "www.amazon.it" and
+# "checkout.amazon.it" when there is no more specific [sites.*] entry for
+# them). The MOST SPECIFIC match wins: an exact "checkout.amazon.it" entry
+# beats "amazon.it", which beats no entry at all. The host is read from
+# $QUTE_URL. --profile / --overwrite / --no-overwrite on the command line
+# always override the settings below; `skip` has no CLI equivalent (it is
+# site-only). All three keys in a [sites.*] block are optional.
+#
+#   profile     Profile name to use on this site instead of `default` above.
+#   overwrite   true/false -- same meaning as --overwrite/--no-overwrite.
+#   skip        List of field "kinds" (see below) to NEVER fill on this site,
+#               even if classify() would otherwise recognise the field.
+#
+# Field kind names usable in `skip` (these are exactly the values autofill.js
+# fills in from your profile -- see valueForKind() in
+# ~/.local/share/qutebrowser/userscripts/autofill.js):
+#   given_name, family_name, full_name, email, phone, phone_national,
+#   organization, street, house_number, address_line2, neighborhood,
+#   street_full, postal_code, city, province, province_code, country,
+#   country_code, birth_date, birth_day, birth_month, birth_year,
+#   codice_fiscale, partita_iva, nif, cpf, vat
+#
+# Example (commented out):
+# [sites."amazon.it"]
+# profile = "italia"
+# skip = ["phone", "birth_date"]
+# overwrite = true
+#
+# [sites."work.example.com"]
+# profile = "portugal"
+'''
+
+
+def fifo_send(*lines: str) -> None:
+    """Append one or more qutebrowser command lines to $QUTE_FIFO.
+
+    Each line is executed as a separate qutebrowser command (the FIFO reader
+    in qutebrowser splits strictly on newlines), so any string argument that
+    might contain spaces must already be quoted with qb_quote().
+    """
+    text = "".join(line + "\n" for line in lines)
+    if not FIFO_PATH:
+        # Not running as a real userscript (e.g. invoked by hand while
+        # developing) -- fall back to stderr so nothing is silently lost.
+        sys.stderr.write(text)
+        return
+    with open(FIFO_PATH, "a", encoding="utf-8") as fifo:
+        fifo.write(text)
+
+
+def qb_quote(text: str) -> str:
+    """Quote a string as a single argument for qutebrowser's command parser.
+
+    qutebrowser's FIFO/command-line lexer (qutebrowser.misc.split) is a fork
+    of Python's shlex: inside double quotes, backslash escapes both `\\` and
+    `"`, which is exactly what this produces.
+    """
+    escaped = text.replace("\\", "\\\\").replace('"', '\\"')
+    return '"' + escaped + '"'
+
+
+def message_info(text: str) -> None:
+    fifo_send("message-info " + qb_quote(text))
+
+
+def message_error(text: str) -> None:
+    fifo_send("message-error " + qb_quote(text))
+
+
+def ensure_profiles_file() -> bool:
+    """Create the autofill dir + template profiles.toml if missing.
+
+    Returns True if the template was just created (caller should stop: there
+    is nothing real to fill in yet).
+    """
+    created = False
+    AUTOFILL_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(AUTOFILL_DIR, stat.S_IRWXU)  # 700, enforced every run
+    if not PROFILES_PATH.exists():
+        PROFILES_PATH.write_text(TEMPLATE, encoding="utf-8")
+        created = True
+    if PROFILES_PATH.exists():
+        os.chmod(PROFILES_PATH, stat.S_IRUSR | stat.S_IWUSR)  # 600, enforced every run
+    return created
+
+
+def load_profiles() -> dict:
+    with open(PROFILES_PATH, "rb") as f:
+        return tomllib.load(f)
+
+
+def json_safe(value):
+    if isinstance(value, (datetime.date, datetime.datetime)):
+        return value.isoformat()
+    return value
+
+
+def choose_profile_with_rofi(names: list[str]) -> str | None:
+    try:
+        proc = subprocess.run(
+            ["rofi", "-dmenu", "-p", "autofill profile"],
+            input="\n".join(names) + "\n",
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        message_error("autofill: rofi is not installed")
+        return None
+    if proc.returncode != 0:
+        return None  # user cancelled (Escape)
+    selection = proc.stdout.strip()
+    return selection or None
+
+
+def resolve_host() -> str:
+    """The lowercased hostname of the current page, from $QUTE_URL."""
+    url = os.environ.get("QUTE_URL", "")
+    try:
+        return (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return ""
+
+
+def host_candidates(host: str) -> list[str]:
+    """`host` and each of its parent domains, most specific first.
+
+    e.g. "checkout.amazon.it" -> ["checkout.amazon.it", "amazon.it", "it"]
+    """
+    host = (host or "").lower().strip(".")
+    if not host:
+        return []
+    parts = host.split(".")
+    return [".".join(parts[i:]) for i in range(len(parts))]
+
+
+def resolve_site_settings(host: str, sites: dict) -> dict:
+    """The most specific `[sites.*]` entry (from profiles.toml) matching `host`.
+
+    `sites` is `data.get("sites", {})`, keyed by hostname -- an exact host
+    ("checkout.amazon.it") or any parent domain ("amazon.it", matching
+    "checkout.amazon.it" too when there is no more specific entry). Returns
+    {} when nothing matches, so callers can always do
+    `site.get("profile")` / `site.get("overwrite")` / `site.get("skip", [])`
+    without checking for None first.
+    """
+    if not host or not sites:
+        return {}
+    lowered = {str(k).lower(): v for k, v in sites.items()}
+    for candidate in host_candidates(host):
+        if candidate in lowered and isinstance(lowered[candidate], dict):
+            return lowered[candidate]
+    return {}
+
+
+def build_undo_invocation() -> str:
+    """The single jseval snippet for `autofill --undo`.
+
+    Deliberately just ONE `:jseval --world jseval` call -- no `--file` reload
+    of autofill.js first. Reloading first would itself be destructive: it
+    redefines the isolated world's QuteAutofill global from scratch, which
+    would wipe out exactly the fill history we're trying to undo (see the
+    module docstring on why the isolated `jseval` world persists that global
+    across calls). Instead this snippet tolerates a fresh/undefined global
+    inline, in JS, and reports "nothing to undo" rather than erroring --
+    covering both "autofill was never run this page load" and "QuteAutofill
+    is simply undefined because the world was reset" identically.
+    """
+    return (
+        "(function(){"
+        "if (typeof QuteAutofill === 'undefined' || !QuteAutofill.undo) "
+        "{return 'autofill: nothing to undo';} "
+        "try{return QuteAutofill.undo().summary;}"
+        "catch(e){return 'autofill error: '+(e&&e.message?e.message:String(e));}"
+        "})()"
+    )
+
+
+def spawn_miss_classifier(host: str) -> None:
+    """Best-effort, fully detached background job: re-run the SAME
+    classifier (autofill.js, via autofill-lib/run-classify.js + jsdom) over
+    a dump of the current page and append anything it could not classify to
+    misses.jsonl, to help improve the keyword tables later. See the module
+    docstring section "Learn from misses" -- never sends field VALUES
+    anywhere, only structural metadata (type/name/id/placeholder/
+    autocomplete/truncated label text).
+
+    Degrades completely silently (no message to the user, ever) if node or
+    jsdom aren't available, or if anything else about this goes wrong: this
+    is a nice-to-have, and must never make the actual fill look like it
+    failed.
+    """
+    html_src = os.environ.get("QUTE_HTML")
+    if not html_src:
+        return
+    node_bin = shutil.which("node")
+    if not node_bin or not MISS_RUNNER_PATH.exists():
+        return
+
+    try:
+        MISSES_DIR.mkdir(parents=True, exist_ok=True)
+        os.chmod(MISSES_DIR, stat.S_IRWXU)  # 700, enforced every run
+        if not MISSES_PATH.exists():
+            MISSES_PATH.touch()
+        os.chmod(MISSES_PATH, stat.S_IRUSR | stat.S_IWUSR)  # 600, enforced every run
+    except OSError:
+        return
+
+    # $QUTE_HTML points at a temp file qutebrowser deletes the instant THIS
+    # process exits (see qutebrowser/commands/userscripts.py: _cleanup() is
+    # wired to the GUIProcess `finished` signal for the very process running
+    # this script) -- a real race against a detached background reader that
+    # is still starting up. So make our OWN private copy synchronously,
+    # right here, before main() returns; the background job reads (and
+    # deletes) that copy, never the original, so the race never matters.
+    # Fallback cleanup: remove DOM-dump copies a crashed/killed runner left behind.
+    for stale in MISSES_DIR.glob(".dom-*.html"):
+        try:
+            if time.time() - stale.stat().st_mtime > 600:
+                stale.unlink()
+        except OSError:
+            pass
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", suffix=".html",
+            dir=str(MISSES_DIR), prefix=".dom-", delete=False,
+        ) as tmp:
+            with open(html_src, "r", encoding="utf-8", errors="replace") as src:
+                shutil.copyfileobj(src, tmp)
+            html_copy = tmp.name
+        os.chmod(html_copy, stat.S_IRUSR | stat.S_IWUSR)
+    except OSError:
+        return
+
+    date_str = datetime.date.today().isoformat()
+    try:
+        subprocess.Popen(
+            [node_bin, str(MISS_RUNNER_PATH), html_copy, host, str(MISSES_PATH), date_str],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError:
+        try:
+            os.remove(html_copy)
+        except OSError:
+            pass
+
+
+def normalize_label(text: str) -> str:
+    text = text or ""
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    text = text.lower().strip()
+    return re.sub(r"\s+", " ", text)
+
+
+def build_misses_report(records: list) -> str:
+    """A human-readable report grouping misses.jsonl by normalized label
+    text, most frequent first -- exactly what `autofill --misses` writes."""
+    groups: dict = {}
+    no_label = {"count": 0, "hosts": set()}
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        label = str(rec.get("label_text") or "").strip()
+        host = str(rec.get("host") or "") or "(unknown host)"
+        if not label:
+            no_label["count"] += 1
+            no_label["hosts"].add(host)
+            continue
+        key = normalize_label(label)
+        group = groups.setdefault(key, {"count": 0, "raw": label, "hosts": set()})
+        group["count"] += 1
+        group["hosts"].add(host)
+
+    lines = [
+        "autofill misses report",
+        f"generated: {datetime.datetime.now().isoformat(timespec='seconds')}",
+        f"total records: {len(records)}, unique labels: {len(groups)}",
+        "",
+    ]
+    ranked = sorted(groups.items(), key=lambda kv: (-kv[1]["count"], kv[1]["raw"]))
+    for _key, group in ranked:
+        hosts = ", ".join(sorted(group["hosts"]))
+        lines.append(f"{group['count']:4d}x  \"{group['raw']}\"  hosts: {hosts}")
+    if no_label["count"]:
+        hosts = ", ".join(sorted(no_label["hosts"]))
+        lines.append(f"{no_label['count']:4d}x  (no label text)  hosts: {hosts}")
+    if not records:
+        lines.append("(no unclassified fields recorded yet -- nothing to report)")
+    return "\n".join(lines) + "\n"
+
+
+def handle_misses_report() -> int:
+    records = []
+    if MISSES_PATH.exists():
+        with open(MISSES_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+
+    report_text = build_misses_report(records)
+    report_path = MISSES_DIR / "misses-report.txt"
+    try:
+        MISSES_DIR.mkdir(parents=True, exist_ok=True)
+        os.chmod(MISSES_DIR, stat.S_IRWXU)  # 700
+        report_path.write_text(report_text, encoding="utf-8")
+        os.chmod(report_path, stat.S_IRUSR | stat.S_IWUSR)  # 600
+    except OSError as e:
+        message_error(f"autofill: could not write misses report: {e}")
+        return 1
+
+    fifo_send(f"open -t file://{quote(str(report_path))}")
+    return 0
+
+
+def _dump_one_line(obj) -> str:
+    """JSON-encode `obj` for direct embedding in a single jseval FIFO line.
+
+    json.dumps() always backslash-escapes control characters (including
+    newline/carriage-return), so the result can never itself contain a raw
+    '\\n' -- which matters here because qutebrowser's FIFO reader executes
+    one command per physical line. \\u2028/\\u2029 are valid JSON but are
+    additionally escaped here defensively (older/non-module JS engines
+    historically treated them as line terminators inside string literals;
+    QtWebEngine's current V8 no longer requires this, but it costs nothing).
+    """
+    text = json.dumps(obj, ensure_ascii=False)
+    text = text.replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
+    if "\n" in text or "\r" in text:
+        # Should be unreachable given json.dumps' escaping; fail loudly
+        # rather than silently emit a broken multi-line FIFO command.
+        raise RuntimeError("internal error: JSON payload contained a raw newline")
+    return text
+
+
+def build_invocation(profile: dict, opts: dict) -> str:
+    """Build the single-line JS snippet that runs QuteAutofill and returns
+    the summary string qutebrowser will show via message.info()."""
+    return (
+        "(function(){try{var res=QuteAutofill.run("
+        + _dump_one_line(profile) + "," + _dump_one_line(opts) +
+        ");return res.summary;}catch(e){"
+        "return 'autofill error: '+(e&&e.message?e.message:String(e));}})()"
+    )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Fill web forms from a local autofill profile")
+    parser.add_argument("--profile", help="profile name to use (default: the `default` profile in profiles.toml, "
+                                           "or a [sites.*] entry matching the current host)")
+    parser.add_argument("--choose", action="store_true", help="pick the profile via a rofi menu")
+    parser.add_argument(
+        "--overwrite", action=argparse.BooleanOptionalAction, default=None,
+        help="also replace fields that already have a value (overrides any [sites.*] `overwrite` setting; "
+             "default: only fill empty fields, or whatever the matching [sites.*] entry says)",
+    )
+    parser.add_argument("--undo", action="store_true",
+                         help="undo the fields the last autofill run changed on this page (does not need "
+                              "profiles.toml at all)")
+    parser.add_argument("--misses", action="store_true",
+                         help="write a report of fields autofill could not classify (see misses.jsonl) "
+                              "and open it in a new tab")
+    args = parser.parse_args()
+
+    if args.undo:
+        # Deliberately only ONE jseval call here -- see build_undo_invocation().
+        fifo_send(f"jseval --world jseval {build_undo_invocation()}")
+        return 0
+
+    if args.misses:
+        return handle_misses_report()
+
+    if ensure_profiles_file():
+        message_info(
+            f"autofill: created template profiles.toml at {PROFILES_PATH} "
+            "- edit it with your real data before using autofill"
+        )
+        return 0
+
+    try:
+        data = load_profiles()
+    except tomllib.TOMLDecodeError as e:
+        message_error(f"autofill: could not parse {PROFILES_PATH}: {e}")
+        return 1
+
+    profiles = data.get("profiles", {})
+    if not profiles:
+        message_error(f"autofill: no [profiles.*] sections found in {PROFILES_PATH}")
+        return 1
+
+    host = resolve_host()
+    site = resolve_site_settings(host, data.get("sites", {}) or {})
+
+    if args.choose:
+        chosen = choose_profile_with_rofi(sorted(profiles.keys()))
+        if chosen is None:
+            return 0  # cancelled, or rofi missing (already reported)
+        profile_name = chosen
+    elif args.profile:
+        profile_name = args.profile
+    elif site.get("profile"):
+        profile_name = site["profile"]
+    else:
+        profile_name = data.get("default")
+        if not profile_name:
+            message_error("autofill: no --profile given and no `default` set in profiles.toml")
+            return 1
+
+    if profile_name not in profiles:
+        message_error(f"autofill: unknown profile '{profile_name}' (have: {', '.join(sorted(profiles.keys()))})")
+        return 1
+
+    # CLI flags always override [sites.*] settings; skip has no CLI
+    # equivalent (site-only, per the task spec).
+    if args.overwrite is not None:
+        overwrite = args.overwrite
+    elif site.get("overwrite") is not None:
+        overwrite = bool(site["overwrite"])
+    else:
+        overwrite = False
+    skip_kinds = [str(k) for k in (site.get("skip") or [])]
+
+    profile = {k: json_safe(v) for k, v in profiles[profile_name].items()}
+    opts = {
+        "overwrite": overwrite,
+        "profileName": profile_name,
+        "strictVisibility": True,
+        "skipKinds": skip_kinds,
+    }
+
+    invocation = build_invocation(profile, opts)
+
+    # jseval's js-code argument is parsed with maxsplit=0/no_cmd_split=True:
+    # it is the raw rest-of-line, NOT run through qutebrowser's shell-like
+    # quote parsing (that's what lets arbitrary JS/paths through unmangled).
+    # So JS_SOURCE_PATH is given here unquoted -- it never contains spaces or
+    # shell metacharacters. Both calls target the isolated "jseval" world (see
+    # module docstring): the first loads the non-sensitive classifier library
+    # fresh from disk, the second (profile-bearing) line is never written to
+    # disk anywhere.
+    fifo_send(
+        # --quiet here: this call's only job is to (re)define QuteAutofill;
+        # its JS completion value (undefined) is not useful to show, only the
+        # second call's return value (the summary) should reach the user.
+        f"jseval --file --quiet --world jseval {JS_SOURCE_PATH}",
+        f"jseval --world jseval {invocation}",
+    )
+
+    spawn_miss_classifier(host)  # best-effort, detached, never blocks/errors the fill above
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,350 @@
+#!/usr/bin/env python3
+"""qutebrowser userscript: KeePassXC login lookup with a domain-widening
+cascade, replacing the `pw` binding's direct use of the third-party
+`qute-keepassxc` (which is left untouched and still used for `--totp`'s
+sibling association and, unmodified, as this script's imported protocol
+client - see kpxc_lookup.py).
+
+Problem this solves
+--------------------
+qute-keepassxc's `pw` calls KeePassXC's `get-logins` with the *exact* page
+URL only. KeePassXC's own matching (see kpxc_lookup.py's module docstring
+for the full citation of its actual 2.7.12 source) only ever compares
+scheme+host+port, and an entry saved at a broader host matches any of its
+subdomains automatically - but never the reverse, and never a different,
+unrelated (sibling-subdomain or cross-domain) host. So the user's usual
+symptom - "no credentials found" while on the right site but the wrong
+page/subdomain/scheme - is structural, not a KeePassXC misconfiguration
+(their `keepassxc.ini`'s `[Browser]` section is just `Enabled=true`, i.e.
+defaults throughout).
+
+This script instead runs kpxc_lookup.lookup()'s cascade: a remembered
+alias for this host, then the exact page URL, its origin, the other
+scheme, each parent domain down to the registrable domain (bare and
+`www.`), and finally the registrable domain with common login-subdomain
+guesses (accounts., login., auth., ... - see kpxc_lookup.LOGIN_SUBDOMAIN_PREFIXES)
+- stopping at the first URL that returns anything. A match found only
+through that last, guessed step is announced ("keepassxc: matched
+accounts.example.com") and remembered as this host's alias immediately,
+so the guess only has to work once. If nothing in the cascade matches at
+all, falls back to an interactive "search which site?" prompt (itself run
+through the same cascade, guesses included) whose answer, once it finds
+something, is remembered as that host's alias for next time too.
+
+Usage (see ~/.config/qutebrowser/config.py - `pw` rebound to this script,
+`pT` added for --totp; the original qute-keepassxc file is untouched and
+its own default --key still applies):
+
+    :spawn --userscript keepassxc-login --key YOUR_GPG_KEY_ID
+    :spawn --userscript keepassxc-login --key YOUR_GPG_KEY_ID --totp
+    :spawn --userscript keepassxc-login --key YOUR_GPG_KEY_ID --forget
+
+Reuse of qute-keepassxc and kpxc_lookup
+-----------------------------------------
+Like keepassxc-newpass, this script never modifies qute-keepassxc; it
+loads it as a module via kpxc_lookup.load_qute_keepassxc() and reuses its
+NaCl-box protocol client, association-key store and connect-or-associate
+flow verbatim. The lookup cascade, alias storage and qutebrowser-FIFO
+plumbing live in the shared kpxc_lookup.py module (imported as `kl`
+below), used by keepassxc-newpass too.
+
+Filling, unlike qute-keepassxc's own `make_js_code` (which runs in the
+page's normal JS world via plain `jseval -q`), happens through
+`jseval --quiet --world jseval` (an isolated world, same as
+keepassxc-newpass's `build_fill_js`) using a native property setter plus
+bubbling `input`/`change` events, so frameworks that hook the input's
+setter (React, Vue, ...) still see the change.
+
+Never shows a password anywhere (rofi list, qutebrowser messages, stdout/
+stderr): only login/title/URL are ever displayed for picking an entry.
+"""
+
+import argparse
+import os
+import subprocess
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+from urllib.parse import urlparse
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR))
+import kpxc_lookup as kl  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="KeePassXC login lookup with a domain-widening cascade")
+    parser.add_argument("url", nargs="?", default=os.environ.get("QUTE_URL"))
+    parser.add_argument("--totp", action="store_true",
+                         help="fill the current TOTP field instead of username/password")
+    parser.add_argument("--forget", action="store_true",
+                         help="forget the remembered alias for this page's host and exit")
+    parser.add_argument("--socket", "-s",
+                         default=os.environ.get("QUTE_KEEPASSXC_SOCKET",
+                                                 "/run/user/{}/org.keepassxc.KeePassXC.BrowserServer".format(os.getuid())),
+                         help="path to the KeePassXC browser-protocol socket")
+    parser.add_argument("--key", "-k", default="alice@example.com",
+                         help="GPG key the association key is encrypted with (pass the SAME key as the old "
+                              "`pw` binding to reuse its association)")
+    parser.add_argument("--insecure", action="store_true", help="do not GPG-encrypt the association key file")
+    return parser.parse_args(argv)
+
+
+def _host_of(url: str) -> str:
+    parsed = urlparse(url)
+    return (parsed.hostname or parsed.netloc or url or "").lower()
+
+
+# ---------------------------------------------------------------------------
+# rofi pickers - never show a password
+# ---------------------------------------------------------------------------
+
+def select_entry(entries):
+    """rofi -dmenu -i, one line per entry as "login | title | url" (never
+    the password); Escape cancels. A single entry needs no prompt at all.
+    Returns the chosen entry dict, or None on cancel/no-rofi/bad answer.
+    """
+    if len(entries) == 1:
+        return entries[0]
+    lines = [
+        "{}  |  {}  |  {}".format(
+            e.get("login") or "", e.get("name") or e.get("title") or "", e.get("url") or "",
+        )
+        for e in entries
+    ]
+    try:
+        proc = subprocess.run(
+            ["rofi", "-dmenu", "-i", "-format", "i", "-p", "KeePassXC: select an account"],
+            input="\n".join(lines) + "\n", capture_output=True, text=True, check=False,
+        )
+    except FileNotFoundError:
+        kl.message_error("keepassxc-login: rofi is not installed - cannot pick between multiple accounts")
+        return None
+    if proc.returncode != 0:
+        return None  # Escape / cancelled
+    try:
+        idx = int(proc.stdout.strip())
+    except ValueError:
+        return None
+    if idx < 0 or idx >= len(entries):
+        return None
+    return entries[idx]
+
+
+def prompt_search_term(host, default_domain):
+    """rofi -dmenu text prompt, prefilled with `default_domain` (Enter
+    accepts it as-is, typing replaces it - same -filter technique as
+    keepassxc-newpass's prompt_login). Escape cancels (returns None).
+    """
+    try:
+        proc = subprocess.run(
+            ["rofi", "-dmenu", "-p", f"KeePassXC: no entry for {host}. Search which site?",
+             "-filter", default_domain],
+            input=default_domain + "\n", capture_output=True, text=True, check=False,
+        )
+    except FileNotFoundError:
+        kl.message_error("keepassxc-login: rofi is not installed")
+        return None
+    if proc.returncode != 0:
+        return None
+    typed = proc.stdout.strip()
+    return typed or default_domain
+
+
+# ---------------------------------------------------------------------------
+# Filling the page (isolated jseval world, native setter + bubbling events)
+# ---------------------------------------------------------------------------
+
+def _dump(obj) -> str:
+    return kl._dump_one_line(obj)
+
+
+def build_login_fill_js(login: str, password: str) -> str:
+    """Fill the first form with a password field: every visible text/email
+    input in it gets `login`, every password input gets `password` - same
+    field selection as qute-keepassxc's own `make_js_code`, but using a
+    native property setter (so frameworks whose inputs hook their own
+    setter still observe the change) with bubbling input/change events,
+    same technique as keepassxc-newpass's `build_fill_js`.
+    """
+    template = """
+        (function () {
+            function isVisible(el) {
+                if (!el || !el.isConnected) return false;
+                var win = el.ownerDocument.defaultView;
+                var cs = win.getComputedStyle(el);
+                if (cs.visibility === "hidden" || cs.display === "none" || cs.opacity === "0") return false;
+                var r = el.getBoundingClientRect();
+                return r.width > 0 && r.height > 0;
+            }
+            function nativeSetter(el) {
+                var d = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value");
+                return d && d.set;
+            }
+            function setVal(el, v) {
+                var setter = nativeSetter(el);
+                if (setter) setter.call(el, v); else el.value = v;
+                el.dispatchEvent(new Event("input", { bubbles: true }));
+                el.dispatchEvent(new Event("change", { bubbles: true }));
+            }
+            function hasPasswordField(form) {
+                var inputs = form.getElementsByTagName("input");
+                for (var i = 0; i < inputs.length; i++) {
+                    if (inputs[i].type === "password") return true;
+                }
+                return false;
+            }
+            var LOGIN = %s;
+            var PASSWORD = %s;
+            var forms = document.getElementsByTagName("form");
+            var form = null;
+            for (var i = 0; i < forms.length; i++) {
+                if (hasPasswordField(forms[i])) { form = forms[i]; break; }
+            }
+            if (!form) {
+                return "keepassxc-login: no form with a password field found, nothing filled";
+            }
+            var inputs = form.getElementsByTagName("input");
+            var filledLogin = false, filledPassword = false;
+            for (var j = 0; j < inputs.length; j++) {
+                var input = inputs[j];
+                if (!isVisible(input)) continue;
+                if (input.type === "text" || input.type === "email") {
+                    setVal(input, LOGIN);
+                    filledLogin = true;
+                } else if (input.type === "password") {
+                    setVal(input, PASSWORD);
+                    filledPassword = true;
+                }
+            }
+            return "keepassxc-login: filled" + (filledLogin ? " login" : "") + (filledPassword ? " password" : "");
+        })()
+    """
+    return " ".join(template.splitlines()) % (_dump(login), _dump(password))
+
+
+def build_totp_fill_js(totp: str) -> str:
+    """Fill `document.activeElement` with the current TOTP value, same
+    target-field convention as qute-keepassxc's own `make_js_totp_code`,
+    ported to a native setter + isolated world.
+    """
+    template = """
+        (function () {
+            var input = document.activeElement;
+            if (!input || input.tagName !== "INPUT") {
+                return "keepassxc-login: no input field is focused, nothing filled";
+            }
+            var d = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value");
+            var setter = d && d.set;
+            if (setter) setter.call(input, %s); else input.value = %s;
+            input.dispatchEvent(new Event("input", { bubbles: true }));
+            input.dispatchEvent(new Event("change", { bubbles: true }));
+            return "keepassxc-login: filled TOTP";
+        })()
+    """
+    return " ".join(template.splitlines()) % (_dump(totp), _dump(totp))
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main(argv=None):
+    if "QUTE_FIFO" not in os.environ:
+        print(f"No QUTE_FIFO found - {sys.argv[0]} must be run as a qutebrowser userscript", file=sys.stderr)
+        return 1
+
+    args = parse_args(argv)
+    if not args.url:
+        kl.message_error("keepassxc-login: missing URL")
+        return 1
+
+    host = _host_of(args.url)
+
+    if args.forget:
+        if kl.forget_alias(host):
+            kl.message_info(f"keepassxc: forgot the remembered site for {host}")
+        else:
+            kl.message_info(f"keepassxc: no remembered site for {host}")
+        return 0
+
+    qkpxc = kl.load_qute_keepassxc()
+    ns = SimpleNamespace(key=(None if args.insecure else args.key), insecure=args.insecure, socket=args.socket)
+    try:
+        kp = qkpxc.connect_to_keepassxc(ns)
+    except qkpxc.KeepassError as e:
+        kl.message_error(f"keepassxc-login: {e}")
+        return 1
+    if not kp:
+        # connect_to_keepassxc() already reported the specific reason via message-error
+        return 1
+
+    alias_term = kl.get_alias(host)
+    matched_url, entries = kl.lookup(kp, args.url, alias_term)
+    remembered_this_run = False
+    guessed_host = None
+
+    if entries and not alias_term and kl.is_login_subdomain_guess(matched_url, args.url):
+        # Step (f) of the cascade found this automatically, with no
+        # interactive prompt - a guessed common login subdomain
+        # (accounts.<domain>, login.<domain>, ...) that KeePassXC's own
+        # matching can never surface from the bare/www host. Remember it
+        # immediately so the guess only ever has to work once per host.
+        # Gated on "not alias_term": once a host has a remembered alias,
+        # the alias's own sub-cascade is tried first (see kpxc_lookup's
+        # build_cascade) and can legitimately match the very same URL a
+        # fresh guess would have produced - that's the alias doing its
+        # job, not a new guess, and shouldn't repeat the announcement.
+        guessed_host = urlparse(matched_url).hostname
+        kl.save_alias(host, guessed_host)
+
+    if not entries:
+        default_domain = kl.registrable_domain(host)
+        typed = prompt_search_term(host, default_domain)
+        if typed is None:
+            kl.message_info("keepassxc-login: cancelled")
+            return 0
+        matched_url, entries = kl.lookup(kp, args.url, alias_term=typed)
+        if not entries:
+            kl.message_error(f"keepassxc-login: no entry found for '{typed}'")
+            return 1
+        kl.save_alias(host, typed)
+        remembered_this_run = True
+
+    entry = select_entry(entries)
+    if not entry:
+        kl.message_info("keepassxc-login: cancelled")
+        return 0
+
+    if args.totp:
+        uuid = entry.get("uuid")
+        totp = kp.get_totp(uuid) if uuid else None
+        if not totp:
+            kl.message_error("keepassxc-login: no TOTP key found for this entry")
+            return 1
+        kl.fifo_send(f"jseval --quiet --world jseval {build_totp_fill_js(totp)}")
+    else:
+        login, password = entry.get("login"), entry.get("password")
+        if not login or not password:
+            kl.message_error("keepassxc-login: entry has no login/password to fill")
+            return 1
+        kl.fifo_send(f"jseval --quiet --world jseval {build_login_fill_js(login, password)}")
+
+    if remembered_this_run:
+        kl.message_info(f"keepassxc: using entries of {typed} for {host} (remembered)")
+    elif guessed_host:
+        kl.message_info(f"keepassxc: matched {guessed_host}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as exc:  # noqa: BLE001 - mirrors qute-keepassxc's own top-level catch-all
+        kl.message_error(f"keepassxc-login: {exc}")
+        sys.exit(1)

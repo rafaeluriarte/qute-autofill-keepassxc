@@ -1,0 +1,8 @@
+# FAKE test data only - never the real ~/.config/qutebrowser/autofill/profiles.toml
+default = "fake"
+
+[profiles.fake]
+given_name = "Test"
+family_name = "User"
+username = "testuser"
+email = "testuser@example.invalid"

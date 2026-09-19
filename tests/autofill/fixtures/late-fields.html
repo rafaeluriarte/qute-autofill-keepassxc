@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Two-step form</title></head>
+<body>
+<h1>Shipping</h1>
+<form id="step1">
+  <label for="fn">First Name</label><input id="fn" name="fn"><br>
+  <label for="ln">Last Name</label><input id="ln" name="ln"><br>
+  <button type="button" id="reveal">Continue to address</button>
+</form>
+
+<script>
+document.getElementById('reveal').addEventListener('click', function () {
+  setTimeout(function () {
+    var form = document.getElementById('step1');
+    form.insertAdjacentHTML('beforeend', `
+      <div id="step2">
+        <label for="em">Email Address</label><input id="em" name="em"><br>
+        <label for="addr">Street Address</label><input id="addr" name="addr"><br>
+        <label for="city">City</label><input id="city" name="city">
+      </div>
+    `);
+  }, 1000);
+});
+</script>
+</body>
+</html>

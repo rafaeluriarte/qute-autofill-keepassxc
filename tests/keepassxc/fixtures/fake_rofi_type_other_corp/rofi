@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+"""Fake `rofi`: simulates the user typing over the prefilled default in
+keepassxc-login's "search which site?" prompt (-filter given but
+ignored), answering "other-corp.example" instead. For the account picker
+(-format i) picks index 0."""
+import sys
+argv = sys.argv[1:]
+if "-filter" in argv:
+    print("other-corp.example")
+elif "-format" in argv:
+    print("0")
+else:
+    lines = [line.rstrip("\n") for line in sys.stdin]
+    print(lines[0] if lines else "")
+sys.exit(0)

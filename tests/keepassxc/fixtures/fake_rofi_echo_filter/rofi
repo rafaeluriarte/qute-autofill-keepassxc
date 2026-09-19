@@ -1,0 +1,10 @@
+#!/usr/bin/env python3
+"""Fake `rofi`: simulates the user pressing Enter on the pre-filled value."""
+import sys
+
+if "-filter" in sys.argv:
+    value = sys.argv[sys.argv.index("-filter") + 1]
+else:
+    value = sys.stdin.readline().strip()
+print(value)
+sys.exit(0)

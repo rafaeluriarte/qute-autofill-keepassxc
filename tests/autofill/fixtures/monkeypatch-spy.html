@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Monkeypatch spy</title></head>
+<body>
+<h1>Monkeypatch spy fixture</h1>
+<p>
+  This page's own (main-world) script monkeypatches JSON.stringify,
+  JSON.parse and Object.getOwnPropertyDescriptor and logs every call made
+  through THESE patched copies. If autofill ran in the main world, its call
+  to Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')
+  (to find the native setter) and any JSON handling would go through these
+  exact patched functions, and the profile data would be visible here. If
+  autofill instead runs in an isolated world, it has its own pristine
+  builtins and none of its calls ever reach these patched functions, so the
+  log below should show zero entries after a fill.
+</p>
+<form id="f">
+  <input type="text" id="given" name="given" placeholder="First Name" autocomplete="given-name">
+  <input type="text" id="family" name="family" placeholder="Last Name" autocomplete="family-name">
+  <input type="text" id="cf" name="cf" placeholder="Codice Fiscale">
+  <input type="text" id="cpf" name="cpf" placeholder="CPF">
+  <input type="text" id="nif" name="nif" placeholder="NIF">
+  <input type="text" id="dob" name="dob" placeholder="Date of birth" autocomplete="bday">
+</form>
+<pre id="spy-log"></pre>
+<script>
+(function () {
+  window.__spyLog = [];
+
+  function safeDescribe(value) {
+    // Deliberately avoid calling the (possibly also-patched) JSON.stringify
+    // here to describe args -- use plain string coercion instead, so the spy
+    // itself never depends on the thing it is spying on.
+    if (value === null || value === undefined) return String(value);
+    if (typeof value === 'object') {
+      try {
+        var keys = Object.keys(value);
+        return '{' + keys.join(',') + '}=' + keys.map(function (k) { return String(value[k]); }).join('|');
+      } catch (e) {
+        return '<object>';
+      }
+    }
+    return String(value);
+  }
+
+  function record(kind, args) {
+    var entry = {
+      kind: kind,
+      argc: args.length,
+      args: Array.prototype.map.call(args, safeDescribe),
+      at: Date.now(),
+    };
+    window.__spyLog.push(entry);
+    document.getElementById('spy-log').textContent = window.__spyLog.map(function (e) {
+      return e.kind + '(' + e.args.join(', ') + ')';
+    }).join('\n');
+  }
+
+  var origStringify = JSON.stringify;
+  var origParse = JSON.parse;
+  var origGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+
+  JSON.stringify = function () {
+    record('JSON.stringify', arguments);
+    return origStringify.apply(JSON, arguments);
+  };
+  JSON.parse = function () {
+    record('JSON.parse', arguments);
+    return origParse.apply(JSON, arguments);
+  };
+  Object.getOwnPropertyDescriptor = function () {
+    record('Object.getOwnPropertyDescriptor', arguments);
+    return origGetOwnPropertyDescriptor.apply(Object, arguments);
+  };
+})();
+</script>
+</body>
+</html>

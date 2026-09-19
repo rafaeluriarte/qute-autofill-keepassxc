@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Shadow DOM form</title></head>
+<body>
+<h1>Web component checkout</h1>
+
+<!-- A field OUTSIDE any shadow root, with a label the classifier tables
+     have no rule for -- used to verify the "learn from misses" pipeline
+     end-to-end against a real page. -->
+<label for="favcolor">Fav colour</label>
+<input id="favcolor" name="favcolor">
+
+<my-name-field></my-name-field>
+<my-email-field></my-email-field>
+
+<script>
+class MyNameField extends HTMLElement {
+  connectedCallback() {
+    const root = this.attachShadow({ mode: 'open' });
+    root.innerHTML = `
+      <label for="fn">First Name</label><input id="fn" name="fn">
+      <label for="ln">Last Name</label><input id="ln" name="ln">
+    `;
+  }
+}
+class MyEmailField extends HTMLElement {
+  connectedCallback() {
+    const root = this.attachShadow({ mode: 'open' });
+    root.innerHTML = `<label for="em">Email Address</label><input id="em" name="em" type="email">`;
+  }
+}
+customElements.define('my-name-field', MyNameField);
+customElements.define('my-email-field', MyEmailField);
+</script>
+</body>
+</html>

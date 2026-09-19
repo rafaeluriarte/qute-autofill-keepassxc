@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="it">
+<head><meta charset="utf-8"><title>Checkout</title></head>
+<body>
+<h1>Checkout - Indirizzo di spedizione</h1>
+<form id="checkout">
+  <label for="nome">Nome</label>
+  <input id="nome" name="nome" type="text">
+
+  <label for="cognome">Cognome</label>
+  <input id="cognome" name="cognome" type="text">
+
+  <label for="email">Email</label>
+  <input id="email" name="email" type="email">
+
+  <label for="telefono">Telefono</label>
+  <input id="telefono" name="telefono" type="tel">
+
+  <label for="indirizzo">Indirizzo</label>
+  <input id="indirizzo" name="indirizzo" type="text">
+
+  <label for="civico">Numero civico</label>
+  <input id="civico" name="civico" type="text">
+
+  <label for="cap">CAP</label>
+  <input id="cap" name="cap" type="text" maxlength="5">
+
+  <label for="citta">Citta</label>
+  <input id="citta" name="citta" type="text">
+
+  <label for="provincia">Provincia</label>
+  <select id="provincia" name="provincia">
+    <option value="">Seleziona</option>
+    <option value="FI">Firenze (FI)</option>
+    <option value="RM">Roma (RM)</option>
+    <option value="SI">Siena (SI)</option>
+  </select>
+
+  <label for="cf">Codice Fiscale</label>
+  <input id="cf" name="cf" type="text">
+
+  <!-- decoys: must NOT be filled -->
+  <label for="q">Cerca nel sito</label>
+  <input id="q" name="q" type="text">
+  <input type="hidden" name="csrf_token" value="abc123">
+  <label for="pw">Password</label>
+  <input id="pw" name="password" type="password">
+  <input type="text" name="honeypot" style="display:none" value="">
+  <input type="text" name="numero_carta" placeholder="Numero della carta">
+</form>
+</body>
+</html>

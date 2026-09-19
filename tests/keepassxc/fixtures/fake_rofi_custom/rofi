@@ -1,0 +1,5 @@
+#!/usr/bin/env python3
+"""Fake `rofi`: simulates the user typing a different login than the default."""
+import sys
+print("typed-login@example.test")
+sys.exit(0)

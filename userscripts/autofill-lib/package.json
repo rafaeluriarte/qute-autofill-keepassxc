@@ -1,0 +1,9 @@
+{
+  "name": "autofill-lib",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Runtime deps for the qutebrowser autofill userscript's background miss-classifier (run-classify.js). Not used by qutebrowser/JS-in-page itself -- only by the detached `node` process the Python userscript spawns.",
+  "dependencies": {
+    "jsdom": "^30.1.0"
+  }
+}

@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+"""Fake `rofi`: for the login prompt (-filter given) echoes the default
+login as usual; for any other prompt (update-vs-create, or pick-entry),
+picks the "create new entry" option if present, else the first line.
+"""
+import sys
+
+if "-filter" in sys.argv:
+    print(sys.argv[sys.argv.index("-filter") + 1])
+    sys.exit(0)
+
+lines = [line.rstrip("\n") for line in sys.stdin]
+create = [line for line in lines if line == "create new entry"]
+print(create[0] if create else (lines[0] if lines else ""))
+sys.exit(0)

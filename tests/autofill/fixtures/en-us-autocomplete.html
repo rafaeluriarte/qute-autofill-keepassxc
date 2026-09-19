@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head><meta charset="utf-8"><title>Sign up</title></head>
+<body>
+<h1>Sign up</h1>
+<form id="signup">
+  <input type="text" autocomplete="given-name" id="fn" name="fn">
+  <input type="text" autocomplete="family-name" id="ln" name="ln">
+  <input type="email" autocomplete="email" id="em" name="em">
+  <input type="tel" autocomplete="tel" id="ph" name="ph">
+  <input type="text" autocomplete="organization" id="org" name="org">
+  <input type="text" autocomplete="address-line1" id="a1" name="a1">
+  <input type="text" autocomplete="address-line2" id="a2" name="a2">
+  <input type="text" autocomplete="address-level2" id="city" name="city">
+  <select autocomplete="address-level1" id="state" name="state">
+    <option value="">Select a state</option>
+    <option value="CA">California</option>
+    <option value="NY">New York</option>
+  </select>
+  <input type="text" autocomplete="postal-code" id="zip" name="zip">
+  <select autocomplete="country" id="country" name="country">
+    <option value="">Select a country</option>
+    <option value="US">United States</option>
+    <option value="IT">Italy</option>
+  </select>
+  <input type="date" autocomplete="bday" id="dob" name="dob">
+  <!-- decoy: must not be filled -->
+  <input type="text" autocomplete="cc-number" id="ccnum" name="ccnum">
+  <input type="password" autocomplete="new-password" id="pw" name="pw">
+</form>
+</body>
+</html>
