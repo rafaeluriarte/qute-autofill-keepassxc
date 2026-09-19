@@ -1,0 +1,33 @@
+#!/usr/bin/env python3
+"""Fake `rofi`: pops one pre-programmed answer per invocation from a
+NUL-separated queue file named by $FAKE_ROFI_ANSWERS_FILE - lets a test
+drive a whole multi-prompt keepassxc-login CLI-fallback run (database
+picker, master-password prompt, the combined search/pick prompt, the
+self-healing yes/no) with one flat, ordered list of answers it fully
+controls, independent of which rofi flags any particular prompt used.
+An answer of "__CANCEL__" makes that one invocation simulate Escape
+(exit code 1, no stdout). Running out of queued answers is a hard
+failure (a test bug, not a valid "cancel"), so it also exits 1 but
+prints a marker stderr never asserted-on-affirmatively by any test.
+"""
+import os
+import sys
+
+answers_path = os.environ["FAKE_ROFI_ANSWERS_FILE"]
+with open(answers_path, "r") as f:
+    raw = f.read()
+queue = raw.split("\x00") if raw else []
+
+if not queue:
+    sys.stderr.write("fake_rofi_scripted: answer queue exhausted\n")
+    sys.exit(1)
+
+answer, rest = queue[0], queue[1:]
+with open(answers_path, "w") as f:
+    f.write("\x00".join(rest))
+
+if answer == "__CANCEL__":
+    sys.exit(1)
+
+sys.stdout.write(answer)
+sys.exit(0)

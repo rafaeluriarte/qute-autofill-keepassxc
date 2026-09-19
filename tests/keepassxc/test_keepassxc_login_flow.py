@@ -64,6 +64,17 @@ class LoginFlowTestCase(unittest.TestCase):
         self.fifo_path = os.path.join(self.tmpdir, "fifo")
         Path(self.fifo_path).touch()
 
+        # cli_fallback() (reached whenever nothing at all is found) reads
+        # its own config and, absent one, scans "$HOME" for *.kdbx files -
+        # both MUST be redirected away from the real ones for every test
+        # in this class, not just ones that exercise the CLI fallback on
+        # purpose (see kpxc_lookup.cli_config_path()/discover_candidate_
+        # databases()). fake_home is an empty dir: an accidental scan
+        # finds nothing rather than erroring or, worse, finding something.
+        self.cli_config_path = os.path.join(self.tmpdir, "keepassxc-login.toml")
+        self.fake_home = os.path.join(self.tmpdir, "fake-home")
+        os.makedirs(self.fake_home, exist_ok=True)
+
         self.server = MockKeepassXCServer(self.socket_path)
         self.server.start()
         self.addCleanup(self.server.stop)
@@ -80,6 +91,8 @@ class LoginFlowTestCase(unittest.TestCase):
                 "QUTE_DATA_DIR": self.data_dir,
                 "QUTE_FIFO": self.fifo_path,
                 "QUTE_KEEPASSXC_ALIASES_DIR": self.aliases_dir,
+                "QUTE_KEEPASSXC_CLI_CONFIG": self.cli_config_path,
+                "QUTE_KEEPASSXC_HOME": self.fake_home,
                 "PATH": str(FIXTURES / fixture_dir_name) + os.pathsep + os.environ.get("PATH", ""),
             },
         )
@@ -102,6 +115,51 @@ class LoginFlowTestCase(unittest.TestCase):
             "uuid": entry_uuid, "login": login, "password": password, "url": url, "name": url,
         }
         return entry_uuid
+
+    def _use_filter_recorder_rofi(self):
+        """Swap in a fake `rofi` that, for any -filter prompt (i.e.
+        prompt_search_term's "search which site?" box), appends the
+        -filter value it was given to a record file and then answers with
+        it as usual (so the run continues normally) - lets a test observe
+        exactly what default term a prompt was prefilled with, independent
+        of whatever happens afterwards in the run. For any other prompt
+        (no -filter, e.g. cli_fallback's -format i pickers) it falls back
+        to echoing the first stdin line, like fake_rofi_pick_index_0.
+        Returns the record file's Path; each -filter answer is one line.
+        """
+        record_file = Path(self.tmpdir) / "filter_recorder.txt"
+        recorder_dir = Path(self.tmpdir) / "fake_rofi_filter_recorder"
+        recorder_dir.mkdir(exist_ok=True)
+        (recorder_dir / "rofi").write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys, pathlib\n"
+            f"record_file = pathlib.Path({str(record_file)!r})\n"
+            "argv = sys.argv[1:]\n"
+            "if '-filter' in argv:\n"
+            "    value = argv[argv.index('-filter') + 1]\n"
+            "    with record_file.open('a') as f:\n"
+            "        f.write(value + chr(10))\n"
+            "    print(value)\n"
+            "else:\n"
+            "    lines = [line.rstrip(chr(10)) for line in sys.stdin]\n"
+            "    print(lines[0] if lines else '')\n"
+            "sys.exit(0)\n"
+        )
+        os.chmod(recorder_dir / "rofi", 0o755)
+        self._env_patch.stop()
+        self._env_patch = mock.patch.dict(
+            os.environ,
+            {
+                "QUTE_DATA_DIR": self.data_dir,
+                "QUTE_FIFO": self.fifo_path,
+                "QUTE_KEEPASSXC_ALIASES_DIR": self.aliases_dir,
+                "QUTE_KEEPASSXC_CLI_CONFIG": self.cli_config_path,
+                "QUTE_KEEPASSXC_HOME": self.fake_home,
+                "PATH": str(recorder_dir) + os.pathsep + os.environ.get("PATH", ""),
+            },
+        )
+        self._env_patch.start()
+        return record_file
 
 
 class ExactAndSubdomainMatchTests(LoginFlowTestCase):
@@ -256,7 +314,11 @@ class SearchAndRememberTests(LoginFlowTestCase):
         rc, out, err = self._run("https://portal.example.test/")
         self.assertNotEqual(rc, 0)
         self.assertIn("message-error", self._fifo_contents())
-        self.assertIn("no entry found", self._fifo_contents())
+        # cascade + typed search both fail -> falls through to the
+        # keepassxc-cli database fallback (see LastResortCliFallbackTests),
+        # which here also finds nothing (no database configured, and
+        # fake_home - see setUp - is an empty directory)
+        self.assertIn("no KeePassXC database found to search", self._fifo_contents())
 
     def test_escape_on_search_prompt_cancels(self):
         self._use_rofi("fake_rofi_cancel")
@@ -266,13 +328,11 @@ class SearchAndRememberTests(LoginFlowTestCase):
         self.assertNotIn("jseval", self._fifo_contents())
 
     def test_search_prompt_prefilled_with_registrable_domain(self):
-        # can't observe rofi's actual UI, but can prove the *default*
-        # passed to it is the registrable domain: fake_rofi_pick_index_0
-        # echoes -filter verbatim as the "typed" term, so if there's no
-        # matching entry we see that exact term in the error message.
+        # can't observe rofi's actual UI, but a recording fake rofi can
+        # capture exactly what -filter value prompt_search_term used.
+        record_file = self._use_filter_recorder_rofi()
         rc, out, err = self._run("https://checkout.shop.example.test/cart")
-        self.assertNotEqual(rc, 0)
-        self.assertIn("no entry found for 'example.test'", self._fifo_contents())
+        self.assertEqual(record_file.read_text().splitlines(), ["example.test"])
 
 
 class ForgetTests(LoginFlowTestCase):
@@ -299,12 +359,14 @@ class ForgetTests(LoginFlowTestCase):
         self._seed_entry("https://other-corp.example/", "alice", password="hunter2")
         kl.save_alias("portal.example.test", "other-corp.example")
         self._run("https://portal.example.test/", extra_argv=["--forget"])
-        # now with the default fixture (echoes -filter = the WRONG,
-        # registrable-domain default "example.test"), no entry matches -
-        # proving the remembered shortcut is really gone.
+        # a recording fake rofi proves the search prompt genuinely ran
+        # again (not skipped via the now-forgotten alias) - it's asked for
+        # the registrable-domain default "example.test", which doesn't
+        # match the seeded "other-corp.example" entry.
+        record_file = self._use_filter_recorder_rofi()
         rc, out, err = self._run("https://portal.example.test/")
-        self.assertNotEqual(rc, 0)
-        self.assertIn("no entry found for 'example.test'", self._fifo_contents())
+        self.assertEqual(record_file.read_text().splitlines(), ["example.test"])
+        self.assertIsNone(kl.get_alias("portal.example.test"))
 
 
 class MultipleAccountsPickerTests(LoginFlowTestCase):
@@ -358,6 +420,8 @@ class MultipleAccountsPickerTests(LoginFlowTestCase):
                 "QUTE_DATA_DIR": self.data_dir,
                 "QUTE_FIFO": self.fifo_path,
                 "QUTE_KEEPASSXC_ALIASES_DIR": self.aliases_dir,
+                "QUTE_KEEPASSXC_CLI_CONFIG": self.cli_config_path,
+                "QUTE_KEEPASSXC_HOME": self.fake_home,
                 "PATH": str(recorder_dir) + os.pathsep + os.environ.get("PATH", ""),
             },
         )

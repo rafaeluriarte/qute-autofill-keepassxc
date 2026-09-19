@@ -5,8 +5,13 @@ third-party `qute-keepassxc`'s `pw` binding) and by `keepassxc-newpass`
 (which is refactored to reuse the bits it used to duplicate).
 
 This module is stdlib-only except for what its callers already require
-(`pynacl`, transitively, via qute-keepassxc). It never touches the network
-and never prints/logs credential values.
+(`pynacl`, transitively, via qute-keepassxc) plus, for the CLI-fallback
+config functions only (load_cli_config/save_cli_config and friends,
+lazily imported there rather than at module load), `tomlkit` - already
+installed on this machine, used (not hand-rolled) because it round-trips
+hand-editable comments, which stdlib `tomllib` (read-only) can't write at
+all. It never touches the network and never prints/logs credential
+values.
 
 Contents
 --------
@@ -552,3 +557,195 @@ def lookup(kp, page_url: str, alias_term: str | None = None):
         if entries:
             return candidate, entries
     return None, []
+
+
+# ---------------------------------------------------------------------------
+# CLI fallback config: ~/.config/qutebrowser/keepassxc-login.toml
+#
+# Last resort when the browser-protocol cascade above AND the interactive
+# "search which site?" prompt both find nothing - most commonly because
+# the entry has no URL at all (the browser protocol's get-logins can
+# structurally never return such an entry - see the module docstring) or
+# lives in a database that isn't open in the KeePassXC GUI (the protocol
+# only ever sees currently-open, browser-integration-enabled databases).
+# keepassxc-login then searches the database FILE directly with
+# `keepassxc-cli search`, which matches by title/username, not URL.
+#
+# No secrets ever live in this file: just database paths and a
+# host -> {database, entry path} memory of where a previous CLI search
+# landed. tomlkit (already installed) is used so the file can carry
+# hand-editable comments and round-trip them - imported lazily so its
+# absence only breaks the CLI-fallback feature, not the core cascade
+# above (kpxc_lookup has no other third-party dependency).
+# ---------------------------------------------------------------------------
+
+CLI_CONFIG_HEADER = """\
+# keepassxc-login CLI fallback configuration.
+#
+# Used only as a last resort: when the browser-protocol cascade AND the
+# interactive "search which site?" prompt both find nothing (e.g. an
+# entry has no URL at all, or lives in a database that isn't open in the
+# KeePassXC GUI). keepassxc-cli searches the database FILE directly by
+# title/username, not by URL, and always asks for the master password.
+#
+# databases: .kdbx files keepassxc-cli is allowed to search (~ expands).
+#   Left empty, a bounded scan of $HOME finds candidates and asks once.
+# default_database: used silently even when databases has more than one
+#   entry (optional - otherwise more than one always asks which to use).
+#
+# [remembered]: host -> {database, entry} learned from a previous CLI
+# search, so a later visit can go straight to that entry (the master
+# password is still asked every time - nothing here is a secret).
+"""
+
+
+def cli_config_path() -> Path:
+    """QUTE_KEEPASSXC_CLI_CONFIG overrides it (tests point this at a temp
+    dir so the real file is never touched)."""
+    override = os.environ.get("QUTE_KEEPASSXC_CLI_CONFIG")
+    if override:
+        return Path(override)
+    return Path(os.path.expanduser("~/.config/qutebrowser")) / "keepassxc-login.toml"
+
+
+def _empty_cli_config_doc():
+    import tomlkit
+    doc = tomlkit.parse(CLI_CONFIG_HEADER)
+    doc["databases"] = tomlkit.array()
+    doc["default_database"] = ""
+    doc["remembered"] = tomlkit.table()
+    return doc
+
+
+def load_cli_config():
+    """Returns a tomlkit document - either the parsed config file, or a
+    fresh in-memory skeleton (with the header comment) if it doesn't
+    exist yet or fails to parse. Nothing is written to disk by this call
+    alone - see save_cli_config() - so merely reading the config doesn't
+    create it (it's "created on first use" by whatever first calls
+    save_cli_config(), e.g. after a successful CLI-fallback search).
+    """
+    path = cli_config_path()
+    if not path.exists():
+        return _empty_cli_config_doc()
+    try:
+        import tomlkit
+        return tomlkit.parse(path.read_text(encoding="utf-8"))
+    except Exception:
+        return _empty_cli_config_doc()
+
+
+def save_cli_config(doc) -> None:
+    import tomlkit
+    path = cli_config_path()
+    _ensure_private_dir(path.parent)
+    tmp = path.with_suffix(".toml.tmp")
+    tmp.write_text(tomlkit.dumps(doc), encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def get_cli_databases(doc) -> list[str]:
+    """~-expanded database paths from `doc["databases"]`, blanks dropped."""
+    raw = doc.get("databases") or []
+    return [os.path.expanduser(str(p)) for p in raw if str(p).strip()]
+
+
+def add_cli_database(doc, path: str) -> None:
+    """Append `path` to `doc["databases"]` if not already present."""
+    import tomlkit
+    existing = get_cli_databases(doc)
+    if path in existing:
+        return
+    arr = doc.get("databases")
+    if arr is None:
+        arr = tomlkit.array()
+        doc["databases"] = arr
+    arr.append(path)
+
+
+def get_default_database(doc):
+    """~-expanded default database path, or None if unset/blank."""
+    val = doc.get("default_database")
+    val = str(val).strip() if val else ""
+    return os.path.expanduser(val) if val else None
+
+
+def get_remembered_cli(doc, host: str):
+    """{"database": ..., "entry": ...} (both plain strings, database
+    ~-expanded) for `host`, or None if nothing is remembered for it.
+    """
+    remembered = doc.get("remembered") or {}
+    entry = remembered.get(host)
+    if not entry:
+        return None
+    return {
+        "database": os.path.expanduser(str(entry.get("database", ""))),
+        "entry": str(entry.get("entry", "")),
+    }
+
+
+def set_remembered_cli(doc, host: str, database: str, entry_path: str) -> None:
+    import tomlkit
+    if "remembered" not in doc or doc.get("remembered") is None:
+        doc["remembered"] = tomlkit.table()
+    remembered = doc["remembered"]
+    inline = tomlkit.inline_table()
+    inline["database"] = database
+    inline["entry"] = entry_path
+    remembered[host] = inline
+
+
+def forget_remembered_cli(doc, host: str) -> bool:
+    """Remove the remembered CLI mapping for `host`; returns whether one existed."""
+    remembered = doc.get("remembered")
+    if not remembered or host not in remembered:
+        return False
+    del remembered[host]
+    return True
+
+
+def discover_candidate_databases(home: "str | None" = None, max_depth: int = 4) -> list[str]:
+    """Bounded scan of `home` (default: $QUTE_KEEPASSXC_HOME if set, else
+    the real $HOME) for *.kdbx files, at most `max_depth` path components
+    below it (e.g. ~/Documents/keepass/Passwords.kdbx is 3 deep - within
+    the default bound of 4). Skips `.cache` (anywhere) and
+    `.local/share/Trash` specifically. Symlinks are never followed
+    (avoids loops or escaping `home`). Sorted for a deterministic prompt
+    order.
+
+    The env var exists so tests (and anything else that must never touch
+    the user's real $HOME/personal/** databases) can redirect an
+    unparameterised call - e.g. one made deep inside keepassxc-login's
+    select_cli_database() - without every caller needing to thread a
+    `home=` argument through by hand.
+    """
+    if home is None:
+        home = os.environ.get("QUTE_KEEPASSXC_HOME")
+    home_path = Path(home if home is not None else os.path.expanduser("~")).resolve()
+    trash_rel = Path(".local") / "share" / "Trash"
+    found: list[Path] = []
+
+    def _walk(directory: Path, depth: int) -> None:
+        if depth > max_depth:
+            return
+        try:
+            children = sorted(directory.iterdir())
+        except OSError:
+            return
+        for child in children:
+            if child.is_symlink():
+                continue
+            try:
+                rel = child.relative_to(home_path)
+            except ValueError:
+                continue
+            if child.is_dir():
+                if child.name == ".cache" or rel == trash_rel:
+                    continue
+                _walk(child, depth + 1)
+            elif child.is_file() and child.suffix.lower() == ".kdbx":
+                found.append(child)
+
+    _walk(home_path, 1)
+    return sorted(str(p) for p in found)

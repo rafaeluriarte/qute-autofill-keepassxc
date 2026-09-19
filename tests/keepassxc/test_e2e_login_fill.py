@@ -78,6 +78,14 @@ class E2ELoginFillTests(unittest.TestCase):
         env["QT_QPA_PLATFORM"] = "offscreen"
         env["PATH"] = str(FIXTURES / "fake_rofi_pick_index_0") + os.pathsep + env.get("PATH", "")
         env["QUTE_KEEPASSXC_ALIASES_DIR"] = os.path.join(basedir, "keepassxc-login")
+        # cli_fallback() (reached if nothing at all is found) reads its
+        # own config and, absent one, scans "$HOME" for *.kdbx files -
+        # both redirected into this test's own basedir so the real config
+        # and the real ~/personal/** are never touched.
+        env["QUTE_KEEPASSXC_CLI_CONFIG"] = os.path.join(basedir, "keepassxc-login.toml")
+        fake_home = os.path.join(basedir, "fake-home")
+        os.makedirs(fake_home, exist_ok=True)
+        env["QUTE_KEEPASSXC_HOME"] = fake_home
         url = f"http://127.0.0.1:{self.http_port}/{page}"
         args = " ".join(extra_userscript_args)
         cmd = [

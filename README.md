@@ -37,6 +37,16 @@ KeePassXC only matches a saved entry to a page when the entry's URL is the same 
 
 Whatever works is remembered for next time (`--forget` clears it). Several matches are shown in a rofi list (login, title, URL, never a password). `--totp` fills a TOTP code instead.
 
+If even that finds nothing, because the entry has **no URL at all**, or lives in a database that is not currently open in KeePassXC, the script falls back to searching the database *file* with `keepassxc-cli`:
+
+* it uses your configured database (a rofi picker only if there are several),
+* asks for the master password with rofi (passed to `keepassxc-cli` on stdin only: never on the command line, in an environment variable, in a file, or in any log),
+* one prompt doubles as search box and result list, pre-filled with the site name; entries **without a URL are listed like any other**, because the search goes by title and username,
+* fills the entry you pick,
+* then offers (defaulting to yes) to write the page's URL into that entry, so the fast path works next time. KeePassXC's window may ask to reload the database afterwards, because the file changed on disk.
+
+Databases and the per-site choices are remembered in `~/.config/qutebrowser/keepassxc-login.toml` (no secrets). `--cli` goes straight to this path.
+
 ### keepassxc-newpass (`pn`)
 
 1. Asks for the login (your profile email by default) via rofi.
@@ -51,7 +61,7 @@ Whatever works is remembered for next time (`--forget` clears it). Several match
 * [qute-keepassxc](https://github.com/MB-Tech/qute-keepassxc) by Markus Blöchl for the KeePassXC scripts: they reuse its protocol client and its existing association, so `pw` keeps working as before. Install it in the same userscripts directory, or point `$QUTE_KEEPASSXC` at it.
 * KeePassXC 2.7+ with browser integration enabled, plus `keepassxc-cli` for password generation
 * `rofi` for the pickers
-* `python-pynacl` for the KeePassXC protocol
+* `python-pynacl` for the KeePassXC protocol, `tomlkit` for the lookup config file
 * optional: `node` + `jsdom` for the missed-field report and the test suite
 
 ## Install

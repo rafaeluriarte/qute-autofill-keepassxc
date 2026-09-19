@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /*
  * Unit tests for the qutebrowser `autofill` userscript's classifier/filler
- * (../../userscripts/autofill.js in this repo).
+ * (../../../../.local/share/qutebrowser/userscripts/autofill.js).
  *
  * Uses jsdom (installed locally in this dir's node_modules, `npm install
  * jsdom` -- not global) to build a real DOM from the fixture HTML files in

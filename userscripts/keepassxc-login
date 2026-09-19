@@ -31,6 +31,21 @@ all, falls back to an interactive "search which site?" prompt (itself run
 through the same cascade, guesses included) whose answer, once it finds
 something, is remembered as that host's alias for next time too.
 
+If even that interactive search finds nothing, one gap remains: the
+browser protocol (`get-logins`) can only ever return an entry that (a)
+has a URL set at all and (b) lives in a database currently open in the
+KeePassXC GUI with browser integration on for it. An entry with no URL,
+or one in a database the user keeps closed most of the time, is
+structurally invisible to every step above - real example that prompted
+this: an entry for ticketshop.example with no URL set. `cli_fallback()`
+handles that case by searching the database FILE directly with
+`keepassxc-cli search` (matches by title/username, not URL), then fills
+via `keepassxc-cli show`, exactly like the protocol path but sourced from
+the CLI instead - see that function's own docstring for the full flow
+(database selection, the master-password prompt, the combined search/
+pick prompt, and the optional self-healing URL add). `--cli` jumps
+straight to it, skipping the browser protocol entirely.
+
 Usage (see ~/.config/qutebrowser/config.py - `pw` rebound to this script,
 `pT` added for --totp; the original qute-keepassxc file is untouched and
 its own default --key still applies):
@@ -38,6 +53,7 @@ its own default --key still applies):
     :spawn --userscript keepassxc-login --key YOUR_GPG_KEY_ID
     :spawn --userscript keepassxc-login --key YOUR_GPG_KEY_ID --totp
     :spawn --userscript keepassxc-login --key YOUR_GPG_KEY_ID --forget
+    :spawn --userscript keepassxc-login --key YOUR_GPG_KEY_ID --cli
 
 Reuse of qute-keepassxc and kpxc_lookup
 -----------------------------------------
@@ -63,6 +79,7 @@ import argparse
 import os
 import subprocess
 import sys
+from collections import namedtuple
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlparse
@@ -70,6 +87,10 @@ from urllib.parse import urlparse
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 import kpxc_lookup as kl  # noqa: E402
+
+# Bounded retries for the combined search/pick prompt (prompt_search_or_pick):
+# type a different term as many times as this before giving up.
+CLI_SEARCH_MAX_ATTEMPTS = 5
 
 
 # ---------------------------------------------------------------------------
@@ -82,7 +103,12 @@ def parse_args(argv=None):
     parser.add_argument("--totp", action="store_true",
                          help="fill the current TOTP field instead of username/password")
     parser.add_argument("--forget", action="store_true",
-                         help="forget the remembered alias for this page's host and exit")
+                         help="forget the remembered alias/CLI database mapping for this page's host and exit")
+    parser.add_argument("--cli", action="store_true",
+                         help="skip the browser-protocol lookup entirely and go straight to the "
+                              "keepassxc-cli database-file fallback (see cli_fallback())")
+    parser.add_argument("--cli-path", default=os.environ.get("QUTE_KEEPASSXC_CLI", "keepassxc-cli"),
+                         help="keepassxc-cli executable used for the database-file fallback")
     parser.add_argument("--socket", "-s",
                          default=os.environ.get("QUTE_KEEPASSXC_SOCKET",
                                                  "/run/user/{}/org.keepassxc.KeePassXC.BrowserServer".format(os.getuid())),
@@ -153,6 +179,365 @@ def prompt_search_term(host, default_domain):
         return None
     typed = proc.stdout.strip()
     return typed or default_domain
+
+
+# ---------------------------------------------------------------------------
+# keepassxc-cli database-file fallback
+#
+# Last resort, tried only after the cascade above AND the interactive
+# "search which site?" prompt both find nothing. The browser protocol's
+# get-logins can only ever match entries that (a) have a URL at all and
+# (b) live in a database currently open in the KeePassXC GUI with browser
+# integration enabled for it. Neither holds for, e.g., an old entry saved
+# with no URL, or a second database the user keeps closed most of the
+# time. keepassxc-cli instead opens the database FILE directly and
+# searches by title/username - real example that prompted this: an
+# entry existed for ticketshop.example with no URL set at all.
+#
+# Security: the master password is read once from rofi's own -password
+# mode (never echoed) and passed to every keepassxc-cli call ONLY via
+# that child process's stdin - never as an argv element (visible to any
+# other process via /proc/<pid>/cmdline or `ps`), never as an environment
+# variable (inherited by children, visible via /proc/<pid>/environ), and
+# never written to a file. It is held in a single local variable, reused
+# for however many keepassxc-cli calls one run needs (so the user is
+# only asked once), and the variable is overwritten and dropped as soon
+# as the run is done needing it (see cli_fallback()/_cli_search_loop()'s
+# `password = None` after their last use). Caveat, stated plainly: CPython
+# strings are immutable, so this cannot zero the original memory the
+# password's characters were stored in the way e.g. a C `memset` could -
+# "overwrite then drop the reference" is the best this language allows,
+# making the plaintext eligible for garbage collection promptly rather
+# than lingering referenced for the rest of the process's life. Nothing
+# about the password is ever written to a qutebrowser message, rofi list,
+# the CLI config file, or stdout/stderr.
+# ---------------------------------------------------------------------------
+
+CliResult = namedtuple("CliResult", "ok lines classification")
+
+
+def _classify_cli_stderr(stderr: str) -> str:
+    """Classify a failed keepassxc-cli run from its stderr text (never
+    forwarded to the user verbatim - only this classification is used to
+    pick one of *this script's own* safe, fixed message strings).
+    """
+    if "Invalid credentials" in stderr:
+        return "wrong_password"
+    if "Could not find entry" in stderr:
+        return "not_found"
+    if "No results for that search term" in stderr:
+        return "no_results"
+    if "has no TOTP set up" in stderr:
+        return "no_totp"
+    return "other_error"
+
+
+def run_cli(cli_path, args_tail, password, timeout=25):
+    """Run `cli_path <args_tail>`, feeding `password` on the child's
+    stdin ONLY (never argv, never an env var, never a file - see the
+    section docstring above). `-q` is deliberately NOT passed: verified
+    empirically against keepassxc-cli 2.7.12 that `-q` also silences the
+    *error* text on stderr (e.g. a wrong password becomes a bare exit
+    code 1 with no stderr at all), which this script needs to tell wrong-
+    password apart from "not found"/"no results" - the omitted "Enter
+    password..." prompt text on stderr is harmless (static, never echoes
+    the typed password) and is simply never looked at.
+    """
+    try:
+        proc = subprocess.run(
+            [cli_path] + list(args_tail),
+            input=(password or "") + "\n",
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except FileNotFoundError:
+        return CliResult(False, [], "unavailable")
+    except (OSError, subprocess.TimeoutExpired):
+        return CliResult(False, [], "other_error")
+    if proc.returncode == 0:
+        return CliResult(True, proc.stdout.splitlines(), "ok")
+    return CliResult(False, [], _classify_cli_stderr(proc.stderr or ""))
+
+
+def prompt_yes_no(message, default_yes=False):
+    """rofi -dmenu Yes/No, Escape/No = False. The default answer is the
+    FIRST listed option (rofi highlights it) - never used to auto-answer
+    without the user seeing/confirming the prompt.
+    """
+    options = ["Yes", "No"] if default_yes else ["No", "Yes"]
+    try:
+        proc = subprocess.run(
+            ["rofi", "-dmenu", "-p", message],
+            input="\n".join(options) + "\n", capture_output=True, text=True, check=False,
+        )
+    except FileNotFoundError:
+        kl.message_error("keepassxc-login: rofi is not installed")
+        return False
+    if proc.returncode != 0:
+        return False
+    return proc.stdout.strip() == "Yes"
+
+
+def prompt_pick_database(candidates):
+    """rofi -dmenu -format i over `candidates` plus a trailing "Cancel"
+    row. Returns the chosen path, or None on cancel/Escape/no-rofi.
+    """
+    lines = list(candidates) + ["Cancel"]
+    try:
+        proc = subprocess.run(
+            ["rofi", "-dmenu", "-format", "i", "-p", "KeePassXC: which database?"],
+            input="\n".join(lines) + "\n", capture_output=True, text=True, check=False,
+        )
+    except FileNotFoundError:
+        kl.message_error("keepassxc-login: rofi is not installed")
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        idx = int(proc.stdout.strip())
+    except ValueError:
+        return None
+    if idx < 0 or idx >= len(candidates):
+        return None  # the "Cancel" row, or an out-of-range answer
+    return candidates[idx]
+
+
+def prompt_master_password():
+    """rofi -dmenu -password - the typed characters are never echoed by
+    rofi itself. Returns the password string, or None on cancel/empty/
+    no-rofi. Never printed/logged/messaged by this script either way.
+    """
+    try:
+        proc = subprocess.run(
+            ["rofi", "-dmenu", "-password", "-p", "master password"],
+            input="", capture_output=True, text=True, check=False,
+        )
+    except FileNotFoundError:
+        kl.message_error("keepassxc-login: rofi is not installed")
+        return None
+    if proc.returncode != 0:
+        return None
+    password = proc.stdout.rstrip("\n")
+    return password or None
+
+
+def prompt_search_or_pick(term, results):
+    """ONE rofi prompt that doubles as the search box and the result
+    list: `results` (entry paths - titles/groups only, never a secret)
+    are shown; Enter on a highlighted line picks it, typing something
+    else and Enter searches for that instead (plain rofi -dmenu, without
+    -only-match, returns whatever text ends up in the box even when it
+    matches none of the shown lines - that's what makes a single prompt
+    serve both roles). No -filter/prefill: the box starts empty so every
+    result stays visible and typing is unambiguously "a new term", not a
+    live filter over the list.
+
+    Returns (picked_entry, None) or (None, new_term); (None, None) means
+    cancelled (Escape, or Enter on a still-empty box).
+    """
+    prompt = f"KeePassXC search: {term}" if results else f"no matches for '{term}' - search again"
+    try:
+        proc = subprocess.run(
+            ["rofi", "-dmenu", "-i", "-p", prompt],
+            input=("\n".join(results) + "\n") if results else "",
+            capture_output=True, text=True, check=False,
+        )
+    except FileNotFoundError:
+        kl.message_error("keepassxc-login: rofi is not installed")
+        return None, None
+    if proc.returncode != 0:
+        return None, None
+    choice = proc.stdout.strip()
+    if not choice:
+        return None, None
+    if choice in results:
+        return choice, None
+    return None, choice
+
+
+def _origin_of(url: str) -> str:
+    parsed = urlparse(url)
+    port = f":{parsed.port}" if parsed.port else ""
+    scheme = parsed.scheme or "https"
+    return f"{scheme}://{parsed.hostname}{port}/"
+
+
+def select_cli_database(doc, host):
+    """Step 1 of the CLI fallback, optimised for as few prompts as
+    possible: silent when there's exactly one configured/discovered
+    database (or a configured default_database among several); a rofi
+    picker (with a Cancel row) only when there's a genuine choice to
+    make. A fresh discovery's pick (or its only candidate) is persisted
+    to the config immediately so the scan never has to run again.
+
+    Returns (path, None) on success, or (None, exit_code) on failure -
+    exit_code is 1 with an error already sent (nothing to search at all)
+    or 0 with an info message already sent (the user cancelled a picker),
+    matching this script's cancel-vs-error convention throughout.
+    """
+    databases = kl.get_cli_databases(doc)
+    if databases:
+        if len(databases) == 1:
+            return databases[0], None
+        default_db = kl.get_default_database(doc)
+        if default_db and default_db in databases:
+            return default_db, None
+        chosen = prompt_pick_database(databases)
+        if chosen is None:
+            kl.message_info("keepassxc-login: cancelled")
+            return None, 0
+        return chosen, None
+
+    discovered = kl.discover_candidate_databases()
+    if not discovered:
+        kl.message_error(
+            "keepassxc-login: no KeePassXC database found to search - "
+            f"add one to {kl.cli_config_path()}"
+        )
+        return None, 1
+    chosen = discovered[0] if len(discovered) == 1 else prompt_pick_database(discovered)
+    if chosen is None:
+        kl.message_info("keepassxc-login: cancelled")
+        return None, 0
+    kl.add_cli_database(doc, chosen)
+    kl.save_cli_config(doc)
+    return chosen, None
+
+
+def _cli_search_loop(cli_path, db, password, default_term):
+    """Steps 2-3: the combined search/pick prompt, looping (bounded) each
+    time the user types a new term instead of picking a result. Returns
+    (entry_path, None) on a pick, or (None, error_message_or_None) - the
+    message is None for a plain user cancel (nothing more to report),
+    set for wrong-password/other failure.
+    """
+    term = default_term
+    for _ in range(CLI_SEARCH_MAX_ATTEMPTS):
+        result = run_cli(cli_path, ["search", db, term], password)
+        if not result.ok and result.classification == "wrong_password":
+            return None, "keepassxc-login: wrong master password"
+        results = result.lines if result.ok else []
+        picked, new_term = prompt_search_or_pick(term, results)
+        if picked is None and new_term is None:
+            return None, None  # cancelled
+        if picked is not None:
+            return picked, None
+        term = new_term
+    return None, "keepassxc-login: no entry chosen after several searches"
+
+
+def _cli_show_and_fill(cli_path, db, password, entry_path, totp_mode, page_url, host, doc, already_remembered):
+    """Steps 5-7: read the entry (TOTP or username+password+URL), fill
+    it, offer step 6's self-healing URL add (default Yes), and update the
+    config's remembered mapping accordingly.
+    """
+    if totp_mode:
+        result = run_cli(cli_path, ["show", "-t", db, entry_path], password)
+        if not result.ok:
+            if result.classification == "wrong_password":
+                kl.message_error("keepassxc-login: wrong master password")
+            elif result.classification == "no_totp":
+                kl.message_error("keepassxc-login: no TOTP key found for this entry")
+            else:
+                kl.message_error("keepassxc-login: could not read TOTP from the database")
+            return 1
+        totp = result.lines[0] if result.lines else ""
+        if not totp:
+            kl.message_error("keepassxc-login: no TOTP key found for this entry")
+            return 1
+        kl.fifo_send(f"jseval --quiet --world jseval {build_totp_fill_js(totp)}")
+        kl.message_info(f"keepassxc: filled TOTP from the database ({entry_path})")
+        if not already_remembered:
+            kl.set_remembered_cli(doc, host, db, entry_path)
+            kl.save_cli_config(doc)
+        return 0
+
+    result = run_cli(
+        cli_path, ["show", "-s", "-a", "UserName", "-a", "Password", "-a", "URL", db, entry_path], password,
+    )
+    if not result.ok:
+        if result.classification == "wrong_password":
+            kl.message_error("keepassxc-login: wrong master password")
+        else:
+            kl.message_error("keepassxc-login: could not read that entry from the database")
+        return 1
+    lines = result.lines
+    login = lines[0] if len(lines) > 0 else ""
+    entry_password = lines[1] if len(lines) > 1 else ""
+    existing_url = lines[2] if len(lines) > 2 else ""
+    if not login or not entry_password:
+        kl.message_error("keepassxc-login: entry has no username/password to fill")
+        return 1
+
+    kl.fifo_send(f"jseval --quiet --world jseval {build_login_fill_js(login, entry_password)}")
+    kl.message_info(f"keepassxc: filled from the database ({entry_path})")
+
+    url_added = False
+    if not existing_url.strip():
+        origin = _origin_of(page_url)
+        if prompt_yes_no(
+            f"add {origin} as this entry's URL? (KeePassXC's GUI may ask to reload "
+            "the database if it's open)",
+            default_yes=True,
+        ):
+            edit_result = run_cli(cli_path, ["edit", "--url", origin, db, entry_path], password)
+            if edit_result.ok:
+                kl.message_info(f"keepassxc: added {origin} as this entry's URL")
+                url_added = True
+            else:
+                kl.message_error("keepassxc-login: could not add the URL to this entry")
+
+    if url_added:
+        # The normal, fast protocol cascade will match this host from now
+        # on - drop any remembered CLI shortcut, it'd only be dead weight.
+        if already_remembered and kl.forget_remembered_cli(doc, host):
+            kl.save_cli_config(doc)
+    else:
+        kl.set_remembered_cli(doc, host, db, entry_path)
+        kl.save_cli_config(doc)
+
+    return 0
+
+
+def cli_fallback(host, page_url, totp_mode, cli_path):
+    """The full keepassxc-cli database-file fallback (steps 1-7): only
+    reached after the browser-protocol cascade AND the interactive
+    "search which site?" prompt both find nothing (or --cli forced it
+    directly). Never touches the browser-protocol socket at all.
+    """
+    doc = kl.load_cli_config()
+    remembered = kl.get_remembered_cli(doc, host)
+
+    if remembered:
+        db, entry_path = remembered["database"], remembered["entry"]
+        password = prompt_master_password()
+        if not password:
+            kl.message_info("keepassxc-login: cancelled")
+            return 0
+        rc = _cli_show_and_fill(cli_path, db, password, entry_path, totp_mode, page_url, host, doc, True)
+        password = None  # best-effort: drop the reference promptly (see section docstring)
+        return rc
+
+    db, exit_code = select_cli_database(doc, host)
+    if db is None:
+        return exit_code
+
+    password = prompt_master_password()
+    if not password:
+        kl.message_info("keepassxc-login: cancelled")
+        return 0
+
+    entry_path, error = _cli_search_loop(cli_path, db, password, kl.registrable_domain(host))
+    if entry_path is None:
+        password = None
+        if error:
+            kl.message_error(error)
+            return 1
+        kl.message_info("keepassxc-login: cancelled")
+        return 0
+
+    rc = _cli_show_and_fill(cli_path, db, password, entry_path, totp_mode, page_url, host, doc, False)
+    password = None
+    return rc
 
 
 # ---------------------------------------------------------------------------
@@ -266,11 +651,21 @@ def main(argv=None):
     host = _host_of(args.url)
 
     if args.forget:
-        if kl.forget_alias(host):
+        forgot_alias = kl.forget_alias(host)
+        cli_doc = kl.load_cli_config()
+        forgot_cli = kl.forget_remembered_cli(cli_doc, host)
+        if forgot_cli:
+            kl.save_cli_config(cli_doc)
+        if forgot_alias or forgot_cli:
             kl.message_info(f"keepassxc: forgot the remembered site for {host}")
         else:
             kl.message_info(f"keepassxc: no remembered site for {host}")
         return 0
+
+    if args.cli:
+        # Skip the browser-protocol lookup entirely (never even connects
+        # to the socket) and go straight to the keepassxc-cli fallback.
+        return cli_fallback(host, args.url, args.totp, args.cli_path)
 
     qkpxc = kl.load_qute_keepassxc()
     ns = SimpleNamespace(key=(None if args.insecure else args.key), insecure=args.insecure, socket=args.socket)
@@ -310,8 +705,11 @@ def main(argv=None):
             return 0
         matched_url, entries = kl.lookup(kp, args.url, alias_term=typed)
         if not entries:
-            kl.message_error(f"keepassxc-login: no entry found for '{typed}'")
-            return 1
+            # Last resort: the browser protocol (get-logins) structurally
+            # cannot find an entry with no URL, or one in a database not
+            # currently open with browser integration on - search the
+            # database FILE directly instead (see cli_fallback()).
+            return cli_fallback(host, args.url, args.totp, args.cli_path)
         kl.save_alias(host, typed)
         remembered_this_run = True
 
