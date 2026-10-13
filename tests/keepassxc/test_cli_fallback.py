@@ -158,7 +158,10 @@ class SingleDatabaseNoUrlEntryTests(CliFallbackTestCase):
         super().setUp()
         _create_db(self.db_a, entries=[
             {"title": "Ticketshop.example account", "username": "alice", "password": "hunter2", "url": None},
-            {"title": "Unrelated entry", "username": "bob", "password": "other-pw", "url": None},
+            {
+                "title": "Unrelated entry", "username": "bob", "password": "other-pw",
+                "url": "https://unrelated.example/",
+            },
         ])
         cfg = kl.load_cli_config()
         kl.add_cli_database(cfg, self.db_a)
@@ -272,6 +275,7 @@ class SingleDatabaseNoUrlEntryTests(CliFallbackTestCase):
         self.assertEqual(by_title["Ticketshop.example account"]["username"], "alice")
         self.assertEqual(by_title["Ticketshop.example account"]["url"], "")
         self.assertEqual(by_title["Unrelated entry"]["username"], "bob")
+        self.assertEqual(by_title["Unrelated entry"]["url"], "https://unrelated.example/")
 
         completed = subprocess.CompletedProcess(["rofi"], 0, stdout="1\n", stderr="")
         with mock.patch.object(kpl.subprocess, "run", return_value=completed) as run:
@@ -279,7 +283,7 @@ class SingleDatabaseNoUrlEntryTests(CliFallbackTestCase):
         self.assertEqual(picked, "/Unrelated entry")
         menu_text = run.call_args.kwargs["input"]
         self.assertIn("Ticketshop.example account  |  alice  |", menu_text)
-        self.assertIn("Unrelated entry  |  bob  |", menu_text)
+        self.assertIn("Unrelated entry  |  bob  |  https://unrelated.example/", menu_text)
         self.assertNotIn("hunter2", menu_text)
         self.assertNotIn("other-pw", menu_text)
 
