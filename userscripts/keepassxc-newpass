@@ -83,7 +83,6 @@ NOT print the login value it would use.
 """
 
 import argparse
-import base64
 import os
 import re
 import secrets
@@ -159,21 +158,10 @@ def _set_login(self, url, login, password, submit_url=None, group=None, uuid=Non
          the response's `error` field is `'success'` (or, on older KeePassXC,
          `''`) on success for this specific action.
     """
-    msg = dict(
-        action="set-login",
-        url=url,
-        submitUrl=submit_url or url,
-        id=self.id,
-        login=login,
-        password=password,
-        key=base64.b64encode(self.id_key.public_key.encode()).decode("utf-8"),
+    return kl.set_login(
+        self, url=url, login=login, password=password,
+        submit_url=submit_url, group=group, uuid=uuid,
     )
-    if group:
-        msg["group"] = group
-    if uuid:
-        msg["uuid"] = uuid
-    self.send_msg(msg)
-    return self.recv_msg()
 
 
 # ---------------------------------------------------------------------------

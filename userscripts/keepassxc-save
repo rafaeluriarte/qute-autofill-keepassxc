@@ -1,0 +1,324 @@
+#!/usr/bin/env python3
+"""Save the username/password currently typed in a qutebrowser login form.
+
+The form is read by JavaScript in qutebrowser's isolated ``jseval`` world.
+Because qutebrowser userscripts have no return channel for ``:jseval``, this
+process opens a one-shot loopback HTTP listener with an unguessable path,
+sends the capture command through ``$QUTE_FIFO``, and keeps the credentials
+only in memory. Nothing containing the password is placed in the FIFO, an
+argument, an environment variable, a log, or a file.
+"""
+
+import argparse
+import json
+import os
+import secrets
+import socket as socket_module
+import subprocess
+import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from types import SimpleNamespace
+from urllib.parse import urlparse
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR))
+import kpxc_lookup as kl  # noqa: E402
+
+DEFAULT_CAPTURE_TIMEOUT = 10.0
+DEFAULT_SAVE_TIMEOUT = 60.0
+MAX_CAPTURE_BYTES = 16 * 1024
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Save the login currently typed in the page")
+    parser.add_argument("url", nargs="?", default=os.environ.get("QUTE_URL"))
+    parser.add_argument("--group", default=None, help="KeePassXC group for a newly-created entry")
+    parser.add_argument(
+        "--socket", "-s",
+        default=os.environ.get(
+            "QUTE_KEEPASSXC_SOCKET",
+            "/run/user/{}/org.keepassxc.KeePassXC.BrowserServer".format(os.getuid()),
+        ),
+        help="KeePassXC browser-protocol socket",
+    )
+    parser.add_argument(
+        "--key", "-k", default="alice@example.com",
+        help="GPG key used by the existing qute-keepassxc association",
+    )
+    parser.add_argument("--insecure", action="store_true", help="do not GPG-encrypt the association key file")
+    parser.add_argument("--capture-timeout", type=float, default=DEFAULT_CAPTURE_TIMEOUT)
+    parser.add_argument("--save-timeout", type=float, default=DEFAULT_SAVE_TIMEOUT)
+    return parser.parse_args(argv)
+
+
+def _origin_of(url):
+    parsed = urlparse(url)
+    if not parsed.hostname:
+        return None
+    port = f":{parsed.port}" if parsed.port else ""
+    return f"{parsed.scheme or 'https'}://{parsed.hostname}{port}/"
+
+
+def prompt_yes_no(message, default_yes=True):
+    options = ["Yes", "No"] if default_yes else ["No", "Yes"]
+    try:
+        proc = subprocess.run(
+            ["rofi", "-dmenu", "-p", message],
+            input="\n".join(options) + "\n", capture_output=True, text=True, check=False,
+        )
+    except FileNotFoundError:
+        kl.message_error("keepassxc-save: rofi is not installed")
+        return False
+    return proc.returncode == 0 and proc.stdout.strip() == "Yes"
+
+
+def select_existing_entry(entries, prompt):
+    if len(entries) == 1:
+        return entries[0]
+    lines = [
+        "{}  |  {}  |  {}".format(
+            e.get("login") or "", e.get("name") or "", e.get("url") or "",
+        )
+        for e in entries
+    ]
+    try:
+        proc = subprocess.run(
+            ["rofi", "-dmenu", "-i", "-format", "i", "-p", prompt],
+            input="\n".join(lines) + "\n", capture_output=True, text=True, check=False,
+        )
+    except FileNotFoundError:
+        kl.message_error("keepassxc-save: rofi is not installed")
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        index = int(proc.stdout.strip())
+    except ValueError:
+        return None
+    return entries[index] if 0 <= index < len(entries) else None
+
+
+def choose_update_uuid(entries, login, host):
+    """Choose the entry that must be updated, or None on cancel/no entry."""
+    same_login = [e for e in entries if (e.get("login") or "").casefold() == login.casefold()]
+    candidates = same_login or entries
+    if not candidates:
+        return ""
+    chosen = select_existing_entry(candidates, f"KeePassXC: choose entry to update for {host}")
+    if chosen is None:
+        return None
+    if not same_login and not prompt_yes_no(
+        f"Username differs for the existing {host} entry. Update it?", default_yes=False,
+    ):
+        return None
+    uuid = chosen.get("uuid")
+    if not uuid:
+        kl.message_error("keepassxc-save: existing entry has no UUID; refusing to overwrite")
+        return None
+    return uuid
+
+
+def build_capture_js(callback_url):
+    """Build a secret-free snippet; field values are read only at runtime."""
+    callback = kl._dump_one_line(callback_url)
+    template = r"""
+        (function () {
+            function visible(el) {
+                if (!el || !el.isConnected || el.disabled) return false;
+                var win = el.ownerDocument.defaultView;
+                var style = win.getComputedStyle(el);
+                if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+                var rect = el.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+            }
+            function tokens(el) {
+                return (el.getAttribute("autocomplete") || "").toLowerCase().split(/\s+/);
+            }
+            function collect(root, out, depth) {
+                if (!root || depth > 6) return;
+                Array.prototype.forEach.call(root.querySelectorAll("input"), function (el) { out.push(el); });
+                Array.prototype.forEach.call(root.querySelectorAll("*"), function (el) {
+                    if (el.shadowRoot) collect(el.shadowRoot, out, depth + 1);
+                });
+                Array.prototype.forEach.call(root.querySelectorAll("iframe"), function (frame) {
+                    try { if (frame.contentDocument) collect(frame.contentDocument, out, depth + 1); } catch (_) {}
+                });
+            }
+            function send(payload) {
+                fetch(CALLBACK, {
+                    method: "POST", mode: "no-cors", cache: "no-store",
+                    referrerPolicy: "no-referrer",
+                    headers: { "Content-Type": "text/plain;charset=UTF-8" },
+                    body: JSON.stringify(payload)
+                }).catch(function () {});
+            }
+            var inputs = [];
+            collect(document, inputs, 0);
+            var passwordFields = inputs.filter(function (el) {
+                return el.type === "password" && visible(el) && !!el.value;
+            });
+            if (!passwordFields.length) { send({ error: "no-password" }); return; }
+            var active = document.activeElement;
+            var passwordField = passwordFields.indexOf(active) !== -1 ? active : null;
+            if (!passwordField) {
+                passwordField = passwordFields.find(function (el) {
+                    return tokens(el).indexOf("current-password") !== -1;
+                }) || passwordFields[0];
+            }
+            var loginFields = inputs.filter(function (el) {
+                return visible(el) && !!el.value && (el.type === "text" || el.type === "email" || el.type === "");
+            });
+            var sameForm = loginFields.filter(function (el) { return passwordField.form && el.form === passwordField.form; });
+            var pool = sameForm.length ? sameForm : loginFields;
+            var loginField = pool.find(function (el) {
+                var t = tokens(el);
+                return t.indexOf("username") !== -1 || t.indexOf("email") !== -1;
+            }) || pool.find(function (el) { return el.type === "email"; }) || null;
+            if (!loginField) {
+                var passwordIndex = inputs.indexOf(passwordField);
+                for (var i = passwordIndex - 1; i >= 0 && !loginField; i--) {
+                    if (pool.indexOf(inputs[i]) !== -1) loginField = inputs[i];
+                }
+            }
+            if (!loginField) { send({ error: "no-username" }); return; }
+            send({ username: loginField.value, password: passwordField.value });
+        })()
+    """
+    return " ".join(template.replace("CALLBACK", callback).splitlines())
+
+
+def capture_credentials(timeout=DEFAULT_CAPTURE_TIMEOUT):
+    """Request one in-memory credential payload from the isolated JS world."""
+    token = secrets.token_urlsafe(32)
+    result = {}
+
+    class CaptureHandler(BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler API
+            if self.path != "/" + token:
+                self.send_error(404)
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                length = 0
+            if length <= 0 or length > MAX_CAPTURE_BYTES:
+                self.send_error(400)
+                return
+            try:
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self.send_error(400)
+                return
+            result["payload"] = payload
+            self.send_response(204)
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+
+        def log_message(self, _format, *args):
+            return  # never put request data in logs
+
+    server = HTTPServer(("127.0.0.1", 0), CaptureHandler)
+    server.timeout = timeout
+    try:
+        callback_url = f"http://127.0.0.1:{server.server_port}/{token}"
+        kl.fifo_send(f"jseval --quiet --world jseval {build_capture_js(callback_url)}")
+        server.handle_request()
+    finally:
+        server.server_close()
+
+    payload = result.get("payload")
+    if not isinstance(payload, dict):
+        return None, "capture-timeout"
+    if payload.get("error"):
+        return None, payload["error"]
+    username = payload.get("username")
+    password = payload.get("password")
+    if not isinstance(username, str) or not username or len(username) > 4096:
+        return None, "no-username"
+    if not isinstance(password, str) or not password or len(password) > 4096:
+        return None, "no-password"
+    return {"username": username, "password": password}, None
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    if "QUTE_FIFO" not in os.environ:
+        print(f"No QUTE_FIFO found - {sys.argv[0]} must be run as a qutebrowser userscript", file=sys.stderr)
+        return 1
+    origin = _origin_of(args.url or "")
+    if not origin:
+        kl.message_error("keepassxc-save: missing or invalid URL")
+        return 1
+    host = urlparse(origin).hostname or origin
+
+    credentials, capture_error = capture_credentials(args.capture_timeout)
+    if not credentials:
+        messages = {
+            "no-password": "no non-empty password field found",
+            "no-username": "no non-empty username field found",
+            "capture-timeout": "could not read the form before the capture timed out",
+        }
+        kl.message_error("keepassxc-save: " + messages.get(capture_error, "could not read the login form"))
+        return 1
+
+    if not prompt_yes_no(f"Save password for {host}?", default_yes=True):
+        credentials = None
+        kl.message_info("keepassxc-save: cancelled")
+        return 0
+
+    qkpxc = kl.load_qute_keepassxc()
+    ns = SimpleNamespace(key=(None if args.insecure else args.key), insecure=args.insecure, socket=args.socket)
+    try:
+        kp = qkpxc.connect_to_keepassxc(ns)
+    except qkpxc.KeepassError as exc:
+        credentials = None
+        kl.message_error(f"keepassxc-save: {exc}")
+        return 1
+    if not kp:
+        credentials = None
+        return 1
+
+    alias_term = kl.get_alias(host)
+    _matched_url, entries = kl.lookup(kp, args.url, alias_term)
+    target_uuid = choose_update_uuid(entries, credentials["username"], host)
+    if target_uuid is None:
+        credentials = None
+        kl.message_info("keepassxc-save: cancelled")
+        return 0
+
+    old_timeout = kp.sock.gettimeout()
+    kp.sock.settimeout(args.save_timeout)
+    try:
+        response = kl.set_login(
+            kp,
+            url=origin,
+            submit_url=args.url,
+            login=credentials["username"],
+            password=credentials["password"],
+            group=args.group,
+            uuid=target_uuid or None,
+        )
+    except socket_module.timeout:
+        kl.message_error("keepassxc-save: KeePassXC did not confirm the save in time")
+        return 1
+    except qkpxc.KeepassError as exc:
+        kl.message_error(f"keepassxc-save: save failed: {exc}")
+        return 1
+    finally:
+        credentials = None
+        try:
+            kp.sock.settimeout(old_timeout)
+        except OSError:
+            pass
+
+    if response.get("success") != "true":
+        kl.message_error("keepassxc-save: KeePassXC did not save the entry")
+        return 1
+    verb = "updated" if target_uuid else "saved"
+    kl.message_info(f"keepassxc-save: {verb} password for {host}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

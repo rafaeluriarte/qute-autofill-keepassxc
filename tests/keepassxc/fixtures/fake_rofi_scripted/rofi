@@ -2,7 +2,7 @@
 """Fake `rofi`: pops one pre-programmed answer per invocation from a
 NUL-separated queue file named by $FAKE_ROFI_ANSWERS_FILE - lets a test
 drive a whole multi-prompt keepassxc-login CLI-fallback run (database
-picker, master-password prompt, the combined search/pick prompt, the
+picker, master-password prompt, the all-entry picker, the
 self-healing yes/no) with one flat, ordered list of answers it fully
 controls, independent of which rofi flags any particular prompt used.
 An answer of "__CANCEL__" makes that one invocation simulate Escape

@@ -6,8 +6,7 @@ Isolation:
   - qutebrowser runs with `-B <tempdir>` (a throwaway basedir: its own
     config/data/cache/runtime dirs - QUTE_CONFIG_DIR and QUTE_DATA_DIR for
     every userscript it spawns point inside this tempdir automatically).
-  - `QT_QPA_PLATFORM=offscreen` - no real/virtual display is touched; the
-    DOM/JS behaviour under test doesn't need pixels.
+  - qutebrowser runs under Xvfb, never on the user's display.
   - The userscript is told to use our mock KeePassXC's Unix-socket path via
     --socket, and --insecure (a plaintext association key inside the temp
     basedir) so no GPG key or real KeePassXC is involved.
@@ -49,13 +48,14 @@ from mock_keepassxc_server import MockKeepassXCServer  # noqa: E402
 REAL_SOCKET = "/run/user/{}/org.keepassxc.KeePassXC.BrowserServer".format(os.getuid())
 
 QUTEBROWSER_BIN = shutil.which("qutebrowser")
+XVFB_RUN = shutil.which("xvfb-run")
 
 
 def _extract_info_lines(log_text):
     return [m.group(1) for m in re.finditer(r"INFO:\s(.*)", log_text)]
 
 
-@unittest.skipUnless(QUTEBROWSER_BIN, "qutebrowser not installed")
+@unittest.skipUnless(QUTEBROWSER_BIN and XVFB_RUN, "qutebrowser/xvfb-run not installed")
 class E2EFillTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -106,7 +106,6 @@ class E2EFillTests(unittest.TestCase):
 
     def _run_qutebrowser(self, basedir, page, socket_path, extra_jseval, length=12, timeout=30):
         env = dict(os.environ)
-        env["QT_QPA_PLATFORM"] = "offscreen"
         env["PATH"] = str(FIXTURES / "fake_rofi_echo_filter") + os.pathsep + env.get("PATH", "")
         # find_matching_entries() consults kpxc_lookup's alias store; keep
         # it inside this test's own basedir so the real
@@ -116,7 +115,7 @@ class E2EFillTests(unittest.TestCase):
         env["QUTE_KEEPASSXC_ALIASES_DIR"] = os.path.join(basedir, "keepassxc-login")
         url = f"http://127.0.0.1:{self.http_port}/{page}"
         cmd = [
-            QUTEBROWSER_BIN, "-B", basedir,
+            XVFB_RUN, "-a", QUTEBROWSER_BIN, "-B", basedir,
             f":open {url}",
             ":later 1500 spawn --userscript {} --insecure --socket {} --length {}".format(
                 SCRIPT_PATH, socket_path, length

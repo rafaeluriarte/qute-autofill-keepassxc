@@ -2,7 +2,7 @@
 """End-to-end test: a real, isolated qutebrowser drives the real
 keepassxc-login userscript against a mock KeePassXC and a local HTTP
 fixture server - same isolation approach as test_e2e_fill.py (its own
-docstring explains the -B basedir / QT_QPA_PLATFORM=offscreen / fake rofi
+docstring explains the -B basedir / Xvfb / fake rofi
 / 127.0.0.1-only approach in full; not repeated here).
 
 Exercises the one thing a purely in-process test (test_keepassxc_login_flow.py)
@@ -35,13 +35,14 @@ from mock_keepassxc_server import MockKeepassXCServer  # noqa: E402
 REAL_SOCKET = "/run/user/{}/org.keepassxc.KeePassXC.BrowserServer".format(os.getuid())
 
 QUTEBROWSER_BIN = shutil.which("qutebrowser")
+XVFB_RUN = shutil.which("xvfb-run")
 
 
 def _extract_info_lines(log_text):
     return [m.group(1) for m in re.finditer(r"INFO:\s(.*)", log_text)]
 
 
-@unittest.skipUnless(QUTEBROWSER_BIN, "qutebrowser not installed")
+@unittest.skipUnless(QUTEBROWSER_BIN and XVFB_RUN, "qutebrowser/xvfb-run not installed")
 class E2ELoginFillTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -75,7 +76,6 @@ class E2ELoginFillTests(unittest.TestCase):
 
     def _run_qutebrowser(self, basedir, page, extra_userscript_args, later_commands, timeout=30):
         env = dict(os.environ)
-        env["QT_QPA_PLATFORM"] = "offscreen"
         env["PATH"] = str(FIXTURES / "fake_rofi_pick_index_0") + os.pathsep + env.get("PATH", "")
         env["QUTE_KEEPASSXC_ALIASES_DIR"] = os.path.join(basedir, "keepassxc-login")
         # cli_fallback() (reached if nothing at all is found) reads its
@@ -89,7 +89,7 @@ class E2ELoginFillTests(unittest.TestCase):
         url = f"http://127.0.0.1:{self.http_port}/{page}"
         args = " ".join(extra_userscript_args)
         cmd = [
-            QUTEBROWSER_BIN, "-B", basedir,
+            XVFB_RUN, "-a", QUTEBROWSER_BIN, "-B", basedir,
             f":open {url}",
             *later_commands,
             ":later 1500 spawn --userscript {} --insecure --socket {} {}".format(

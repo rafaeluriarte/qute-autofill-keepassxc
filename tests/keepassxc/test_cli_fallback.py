@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Tests for keepassxc-login's keepassxc-cli database-file fallback
 (cli_fallback() and friends) - the last resort tried when the browser-
-protocol cascade AND the interactive "search which site?" prompt both
-find nothing, most commonly because an entry has no URL at all.
+protocol cascade finds nothing, most commonly because an entry has no
+matching URL at all.
 
 Fully offline, real keepassxc-cli, throwaway databases created with
 `keepassxc-cli db-create` (password on stdin) under a temp dir - never
@@ -15,8 +15,7 @@ discovery scan or config read/write can't reach the real ones).
 Most tests use `--cli` to reach the fallback directly, independent of
 the browser-protocol cascade (already covered in isolation by
 test_keepassxc_login_flow.py) - one test in ReachedNaturallyTests proves
-it's also reached the ordinary way, after the cascade and the interactive
-search both fail.
+it's also reached the ordinary way, immediately after the cascade fails.
 """
 import contextlib
 import importlib.machinery
@@ -152,7 +151,7 @@ class CliFallbackTestCase(unittest.TestCase):
 
 class SingleDatabaseNoUrlEntryTests(CliFallbackTestCase):
     """The core scenario that prompted this feature: an entry with NO URL
-    at all, found by title/username search, filled correctly.
+    at all, found in the complete entry list and filled correctly.
     """
 
     def setUp(self):
@@ -166,9 +165,7 @@ class SingleDatabaseNoUrlEntryTests(CliFallbackTestCase):
         kl.save_cli_config(cfg)
 
     def test_single_configured_database_is_used_silently(self):
-        # only 2 prompts needed: master password, then the combined
-        # search/pick (round 1's automatic search "ticketshop.example" - the
-        # registrable domain - matches by title even with no URL at all)
+        # only 2 prompts needed: master password, then the all-entry picker
         self._queue_answers(MASTER_PASSWORD, "/Ticketshop.example account")
         rc, out, err = self._run("https://ticketshop.example/some/event")
         self.assertEqual(rc, 0, err)
@@ -246,34 +243,45 @@ class SingleDatabaseNoUrlEntryTests(CliFallbackTestCase):
         self.assertEqual(rc, 0, err)
         self.assertIn("cancelled", self._fifo_contents())
 
-    def test_cancel_at_search_pick_prompt(self):
+    def test_cancel_at_all_entry_picker(self):
         self._queue_answers(MASTER_PASSWORD, "__CANCEL__")
         rc, out, err = self._run("https://ticketshop.example/")
         self.assertEqual(rc, 0, err)
         self.assertIn("cancelled", self._fifo_contents())
         self.assertNotIn("jseval", self._fifo_contents())
 
-    def test_editing_the_search_term_then_picking_a_result(self):
-        # first round's default term "ticketshop.example" would already match,
-        # but the user types something else instead ("unrelated") -
-        # proving the combined prompt really re-searches on a typed term.
-        self._queue_answers(MASTER_PASSWORD, "unrelated", "/Unrelated entry")
+    def test_all_entries_are_available_in_the_first_picker(self):
+        """A URL miss must open one live-filterable list of the whole DB.
+
+        The unrelated entry deliberately does not match the current host.
+        Before the regression fix, rofi only received results from
+        ``search ticketshop.example`` and treated this answer as a second
+        search term instead of a selection.
+        """
+        self._queue_answers(MASTER_PASSWORD, "/Unrelated entry")
         rc, out, err = self._run("https://ticketshop.example/")
         self.assertEqual(rc, 0, err)
         fifo = self._fifo_contents()
         self.assertIn('"bob"', fifo)
         self.assertIn('"other-pw"', fifo)
 
-    def test_term_with_no_results_then_a_working_term(self):
-        # a host whose own default term ("something-else.test") matches
-        # neither seeded entry, so round 1 is guaranteed empty too -
-        # every round up to the last needs an explicit typed term.
-        self._queue_answers(
-            MASTER_PASSWORD, "zzz-nothing-matches-zzz", "ticketshop.example", "/Ticketshop.example account",
-        )
-        rc, out, err = self._run("https://something-else.test/")
-        self.assertEqual(rc, 0, err)
-        self.assertIn('"alice"', self._fifo_contents())
+    def test_all_entry_rows_contain_title_username_and_url_but_no_password(self):
+        entries, error = kpl._cli_list_all(KEEPASSXC_CLI, self.db_a, MASTER_PASSWORD)
+        self.assertIsNone(error)
+        by_title = {entry["title"]: entry for entry in entries}
+        self.assertEqual(by_title["Ticketshop.example account"]["username"], "alice")
+        self.assertEqual(by_title["Ticketshop.example account"]["url"], "")
+        self.assertEqual(by_title["Unrelated entry"]["username"], "bob")
+
+        completed = subprocess.CompletedProcess(["rofi"], 0, stdout="1\n", stderr="")
+        with mock.patch.object(kpl.subprocess, "run", return_value=completed) as run:
+            picked = kpl.prompt_all_entries(entries)
+        self.assertEqual(picked, "/Unrelated entry")
+        menu_text = run.call_args.kwargs["input"]
+        self.assertIn("Ticketshop.example account  |  alice  |", menu_text)
+        self.assertIn("Unrelated entry  |  bob  |", menu_text)
+        self.assertNotIn("hunter2", menu_text)
+        self.assertNotIn("other-pw", menu_text)
 
     def test_entry_without_username_or_password_is_a_clean_error(self):
         # keepassxc-cli accepts an empty password at entry-creation time
@@ -284,30 +292,18 @@ class SingleDatabaseNoUrlEntryTests(CliFallbackTestCase):
             input=f"{MASTER_PASSWORD}\n\n", capture_output=True, text=True,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        # default term "ticketshop.example" doesn't match this entry; type "Blank" instead
-        self._queue_answers(MASTER_PASSWORD, "Blank", "/Blank Entry")
+        self._queue_answers(MASTER_PASSWORD, "/Blank Entry")
         rc, out, err = self._run("https://ticketshop.example/")
         self.assertNotEqual(rc, 0)
         self.assertIn("no username/password to fill", self._fifo_contents())
         self.assertNotIn("jseval", self._fifo_contents())
 
-    def test_bounded_retries_then_gives_up(self):
-        terms = ["nope1", "nope2", "nope3", "nope4", "nope5", "nope6"]
-        self._queue_answers(MASTER_PASSWORD, *terms)
-        rc, out, err = self._run("https://ticketshop.example/")
-        self.assertNotEqual(rc, 0)
-        self.assertIn("no entry chosen after several searches", self._fifo_contents())
-
-
 class MultipleDatabasesTests(CliFallbackTestCase):
     def setUp(self):
         super().setUp()
         self.db_b = os.path.join(self.tmpdir, "b.kdbx")
-        # titles contain the registrable domain of the test host below
-        # ("example.test") so the round-1 automatic search already
-        # matches - the point of these tests is the database picker /
-        # default_database, not the search-term editing (covered
-        # elsewhere), so keep the search side of things trivial.
+        # The point of these tests is database selection/default_database;
+        # each chosen database has one trivially identifiable entry.
         _create_db(self.db_a, entries=[
             {"title": "example.test in A", "username": "a-user", "password": "a-pw", "url": None},
         ])
@@ -321,7 +317,7 @@ class MultipleDatabasesTests(CliFallbackTestCase):
 
     def test_picker_shown_when_more_than_one_database(self):
         # database picker (-format i): index 1 = db_b; then master
-        # password; then search/pick within db_b.
+        # password; then the all-entry picker within db_b.
         self._queue_answers("1", MASTER_PASSWORD, "/example.test in B")
         rc, out, err = self._run("https://example.test/")
         self.assertEqual(rc, 0, err)
@@ -431,7 +427,7 @@ class SelfHealingUrlTests(CliFallbackTestCase):
         rc, out, err = self._run("https://ticketshop.example/tickets?ref=abc")
         self.assertEqual(rc, 0, err)
         fifo = self._fifo_contents()
-        self.assertIn("added https://ticketshop.example/ as this entry's URL", fifo)
+        self.assertIn("wrote https://ticketshop.example/ as this entry's URL", fifo)
         # the reload-warning wording itself is asserted in
         # test_url_add_prompt_wording_mentions_the_reload_warning below
         # verified with a FRESH, independent keepassxc-cli call - never
@@ -442,8 +438,32 @@ class SelfHealingUrlTests(CliFallbackTestCase):
         login_after, pw_after = _show(self.db_a, "/Ticketshop.example account", ["UserName", "Password"])
         self.assertEqual(login_after, "alice")
         self.assertEqual(pw_after, "hunter2")
-        # not remembered: the fast protocol path will match from now on
-        self.assertIsNone(kl.get_remembered_cli(kl.load_cli_config(), "ticketshop.example"))
+        # Explicit host -> entry choice is retained as a precise fallback
+        # even though the fast protocol path should match from now on.
+        self.assertEqual(
+            kl.get_remembered_cli(kl.load_cli_config(), "ticketshop.example"),
+            {"database": self.db_a, "entry": "/Ticketshop.example account"},
+        )
+
+    def test_existing_different_url_can_be_replaced_with_current_origin(self):
+        other_db = os.path.join(self.tmpdir, "different-url.kdbx")
+        _create_db(other_db, entries=[
+            {
+                "title": "Account with old URL",
+                "username": "alice",
+                "password": "old-url-entry-password",
+                "url": "https://old.example/",
+            },
+        ])
+        cfg = kl.load_cli_config()
+        cfg["databases"] = [other_db]
+        kl.save_cli_config(cfg)
+
+        self._queue_answers(MASTER_PASSWORD, "/Account with old URL", "Yes")
+        rc, out, err = self._run("https://ticketshop.example/account")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(_show(other_db, "/Account with old URL", ["URL"])[0],
+                         "https://ticketshop.example/")
 
     def test_url_add_prompt_wording_mentions_the_reload_warning(self):
         # capture the rofi -p prompt text itself rather than trusting a
@@ -502,9 +522,9 @@ class RememberedMappingTests(CliFallbackTestCase):
         kl.set_remembered_cli(cfg, "ticketshop.example", self.db_a, "/Ticketshop.example account")
         kl.save_cli_config(cfg)
 
-    def test_remembered_mapping_skips_database_and_search_prompts(self):
+    def test_remembered_mapping_skips_database_and_entry_picker_prompts(self):
         # only ONE answer queued: the master password. If the database
-        # picker or the search/pick prompt were (wrongly) shown too, the
+        # picker or the all-entry prompt were (wrongly) shown too, the
         # queue would run out and fake_rofi_scripted would exit 1.
         self._queue_answers(MASTER_PASSWORD)
         rc, out, err = self._run("https://ticketshop.example/anything")
@@ -523,17 +543,20 @@ class RememberedMappingTests(CliFallbackTestCase):
         self.assertEqual(rc, 0, err)
         self.assertIsNone(kl.get_remembered_cli(kl.load_cli_config(), "ticketshop.example"))
         # now the full flow (database already configured, so no picker;
-        # master password; search/pick) is needed again
+        # master password; all-entry pick) is needed again
         self._queue_answers(MASTER_PASSWORD, "/Ticketshop.example account")
         rc2, out2, err2 = self._run("https://ticketshop.example/")
         self.assertEqual(rc2, 0, err2)
         self.assertIn('"hunter2"', self._fifo_contents())
 
-    def test_adding_the_url_from_a_remembered_mapping_drops_the_mapping(self):
+    def test_adding_the_url_from_a_remembered_mapping_keeps_the_mapping(self):
         self._queue_answers(MASTER_PASSWORD, "Yes")
         rc, out, err = self._run("https://ticketshop.example/")
         self.assertEqual(rc, 0, err)
-        self.assertIsNone(kl.get_remembered_cli(kl.load_cli_config(), "ticketshop.example"))
+        self.assertEqual(
+            kl.get_remembered_cli(kl.load_cli_config(), "ticketshop.example"),
+            {"database": self.db_a, "entry": "/Ticketshop.example account"},
+        )
         url_after = _show(self.db_a, "/Ticketshop.example account", ["URL"])[0]
         self.assertEqual(url_after, "https://ticketshop.example/")
 
@@ -560,7 +583,7 @@ class TotpTests(CliFallbackTestCase):
         self.assertIn("no TOTP key found", self._fifo_contents())
 
     def test_totp_success_path_argv_and_fill(self):
-        # stubs keepassxc-cli's `show -t` response only; search/show for
+        # stubs keepassxc-cli's `show -t` response only; list/show for
         # username+password still go through the real binary via the
         # earlier tests. Confirms: the right argv shape (-t, db, entry)
         # and that a successful TOTP value reaches the fill JS.
@@ -581,9 +604,9 @@ class TotpTests(CliFallbackTestCase):
 
 
 class ReachedNaturallyTests(unittest.TestCase):
-    """Proves cli_fallback() is reached the ordinary way too - after the
-    browser-protocol cascade AND the interactive site-search both fail -
-    not just via --cli. Needs the mock protocol server too (unlike every
+    """Proves cli_fallback() is reached immediately after an ordinary
+    browser-protocol cascade miss, not just via --cli. Needs the mock server
+    too (unlike every
     other class in this file, which uses --cli and never touches it).
     """
 
@@ -631,15 +654,11 @@ class ReachedNaturallyTests(unittest.TestCase):
         kl.save_cli_config(cfg)
 
     @unittest.skipUnless(KEEPASSXC_CLI, "keepassxc-cli not installed")
-    def test_reached_after_cascade_and_search_prompt_both_fail(self):
-        # the mock protocol server has ZERO entries - cascade fails; the
-        # interactive search prompt (no -filter/-format/-password in its
-        # rofi call) consumes the first queued answer as the typed term,
-        # which also matches nothing over the protocol - only then does
-        # the CLI fallback run, finding the (protocol-invisible, no-URL)
-        # entry by title.
+    def test_reached_immediately_after_cascade_fails(self):
+        # The mock protocol server has zero entries, so the complete CLI
+        # picker appears immediately: master password, then selected row.
         Path(self.answers_path).write_text(
-            "\x00".join(["irrelevant-term", MASTER_PASSWORD, "/Ticketshop.example account"])
+            "\x00".join([MASTER_PASSWORD, "/Ticketshop.example account"])
         )
         argv = [
             "https://ticketshop.example/tickets", "--socket", self.socket_path, "--insecure",

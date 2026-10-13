@@ -1,7 +1,7 @@
 """A minimal mock of KeePassXC's browser-integration Unix-socket protocol.
 
 Implements just enough of the real NaCl-box protocol (see qute-keepassxc)
-for deterministic, offline tests of keepassxc-newpass's save-then-fill flow:
+for deterministic, offline tests of both KeePassXC save flows:
 change-public-keys, test-associate, associate, get-logins and set-login
 (create AND update-by-uuid - see keepassxc-newpass's `_set_login()`
 docstring for where the `uuid` field name was confirmed). It never touches

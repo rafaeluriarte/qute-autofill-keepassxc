@@ -144,6 +144,7 @@ only ever has to work once per host.
 
 from __future__ import annotations
 
+import base64
 import importlib.machinery
 import importlib.util
 import ipaddress
@@ -237,6 +238,30 @@ def load_qute_keepassxc(path: Path = QUTE_KEEPASSXC_PATH):
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
     return module
+
+
+def set_login(kp, url, login, password, submit_url=None, group=None, uuid=None):
+    """Send KeePassXC's browser-protocol ``set-login`` action.
+
+    The third-party qute-keepassxc client is read-only, so both save
+    userscripts share this small extension. Credentials remain inside the
+    already-established NaCl box; they are never logged or written to disk.
+    """
+    msg = {
+        "action": "set-login",
+        "url": url,
+        "submitUrl": submit_url or url,
+        "id": kp.id,
+        "login": login,
+        "password": password,
+        "key": base64.b64encode(kp.id_key.public_key.encode()).decode("utf-8"),
+    }
+    if group:
+        msg["group"] = group
+    if uuid:
+        msg["uuid"] = uuid
+    kp.send_msg(msg)
+    return kp.recv_msg()
 
 
 # ---------------------------------------------------------------------------
@@ -562,17 +587,17 @@ def lookup(kp, page_url: str, alias_term: str | None = None):
 # ---------------------------------------------------------------------------
 # CLI fallback config: ~/.config/qutebrowser/keepassxc-login.toml
 #
-# Last resort when the browser-protocol cascade above AND the interactive
-# "search which site?" prompt both find nothing - most commonly because
+# Last resort when the browser-protocol cascade above finds nothing - most
+# commonly because
 # the entry has no URL at all (the browser protocol's get-logins can
 # structurally never return such an entry - see the module docstring) or
 # lives in a database that isn't open in the KeePassXC GUI (the protocol
 # only ever sees currently-open, browser-integration-enabled databases).
-# keepassxc-login then searches the database FILE directly with
-# `keepassxc-cli search`, which matches by title/username, not URL.
+# keepassxc-login then enumerates the database FILE directly with
+# `keepassxc-cli ls` and presents every entry in a live-filterable picker.
 #
 # No secrets ever live in this file: just database paths and a
-# host -> {database, entry path} memory of where a previous CLI search
+# host -> {database, entry path} memory of where a previous CLI selection
 # landed. tomlkit (already installed) is used so the file can carry
 # hand-editable comments and round-trip them - imported lazily so its
 # absence only breaks the CLI-fallback feature, not the core cascade
@@ -582,11 +607,11 @@ def lookup(kp, page_url: str, alias_term: str | None = None):
 CLI_CONFIG_HEADER = """\
 # keepassxc-login CLI fallback configuration.
 #
-# Used only as a last resort: when the browser-protocol cascade AND the
-# interactive "search which site?" prompt both find nothing (e.g. an
+# Used only as a last resort: when the browser-protocol cascade finds
+# nothing (e.g. an
 # entry has no URL at all, or lives in a database that isn't open in the
-# KeePassXC GUI). keepassxc-cli searches the database FILE directly by
-# title/username, not by URL, and always asks for the master password.
+# KeePassXC GUI). keepassxc-cli enumerates the database FILE directly and
+# always asks for the master password.
 #
 # databases: .kdbx files keepassxc-cli is allowed to search (~ expands).
 #   Left empty, a bounded scan of $HOME finds candidates and asks once.
@@ -594,7 +619,7 @@ CLI_CONFIG_HEADER = """\
 #   entry (optional - otherwise more than one always asks which to use).
 #
 # [remembered]: host -> {database, entry} learned from a previous CLI
-# search, so a later visit can go straight to that entry (the master
+# selection, so a later visit can go straight to that entry (the master
 # password is still asked every time - nothing here is a secret).
 """
 
@@ -623,7 +648,7 @@ def load_cli_config():
     exist yet or fails to parse. Nothing is written to disk by this call
     alone - see save_cli_config() - so merely reading the config doesn't
     create it (it's "created on first use" by whatever first calls
-    save_cli_config(), e.g. after a successful CLI-fallback search).
+    save_cli_config(), e.g. after a successful CLI-fallback selection).
     """
     path = cli_config_path()
     if not path.exists():

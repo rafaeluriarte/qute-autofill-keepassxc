@@ -5,11 +5,11 @@ the real one - every test asserts its socket path is not the real one).
 Covers: the domain-widening cascade actually finding entries that a plain
 get-logins(page URL) would miss (subdomain-broader-entry via KeePassXC's
 own matching, and the www-variant/parent-domain case that only this
-cascade's step (e) can find), the "no entry -> search -> remember" flow
-and its alias reuse on a later visit, --forget, --totp, the rofi account
+cascade's step (e) can find), direct all-entry fallback, remembered-alias
+reuse on a later visit, --forget, --totp, the rofi account
 picker (single vs multiple matches, default and non-default pick,
-cancel), and that a password is never printed/logged/shown in a rofi
-line.
+cancel), the direct CLI fallback on a complete miss, and that a password
+is never printed/logged/shown in a rofi line.
 """
 import contextlib
 import importlib.machinery
@@ -117,8 +117,7 @@ class LoginFlowTestCase(unittest.TestCase):
         return entry_uuid
 
     def _use_filter_recorder_rofi(self):
-        """Swap in a fake `rofi` that, for any -filter prompt (i.e.
-        prompt_search_term's "search which site?" box), appends the
+        """Swap in a fake `rofi` that, for any -filter prompt, appends the
         -filter value it was given to a record file and then answers with
         it as usual (so the run continues normally) - lets a test observe
         exactly what default term a prompt was prefilled with, independent
@@ -235,7 +234,7 @@ class LoginSubdomainGuessTests(LoginFlowTestCase):
 
         self.assertEqual(rc, 0, err)
         fifo = self._fifo_contents()
-        # filled, with no detour through the "search which site?" prompt
+        # filled, with no detour through the CLI fallback
         # (fake_rofi_pick_index_0, the default fixture, would have echoed
         # the WRONG term "example.test" back if that prompt had run -
         # which has no seeded entry of its own, so the run would have
@@ -280,59 +279,30 @@ class LoginSubdomainGuessTests(LoginFlowTestCase):
         self.assertIn("matched accounts.example.test", fifo)
 
 
-class SearchAndRememberTests(LoginFlowTestCase):
-    """Nothing in the cascade matches (different registrable domain
-    entirely, like an SSO/accounts.* setup) - falls back to the rofi text
-    prompt, and on success remembers the alias for next time.
-    """
-
-    def test_no_match_prompts_search_and_remembers_on_success(self):
-        self._seed_entry("https://other-corp.example/", "alice", password="hunter2")
-        self._use_rofi("fake_rofi_type_other_corp")
-        rc, out, err = self._run("https://portal.example.test/")
-        self.assertEqual(rc, 0, err)
-        fifo = self._fifo_contents()
-        self.assertIn('"hunter2"', fifo)
-        self.assertIn("using entries of other-corp.example for portal.example.test (remembered)", fifo)
-        self.assertEqual(kl.get_alias("portal.example.test"), "other-corp.example")
+class FallbackAndRememberTests(LoginFlowTestCase):
+    """A complete protocol miss goes directly to the all-entry CLI picker."""
 
     def test_alias_is_reused_on_a_later_visit_without_prompting_again(self):
         self._seed_entry("https://other-corp.example/", "alice", password="hunter2")
         kl.save_alias("portal.example.test", "other-corp.example")
-        # fake_rofi_pick_index_0 (the default in setUp) would fail the
-        # search prompt's expectations if hit (it echoes whatever -filter
-        # value it's given, which would be "portal.example.test" - the
-        # wrong term) - using it here (unchanged from setUp) proves the
-        # search prompt path is never reached.
         rc, out, err = self._run("https://portal.example.test/")
         self.assertEqual(rc, 0, err)
         self.assertIn('"hunter2"', self._fifo_contents())
         self.assertNotIn("remembered", self._fifo_contents())
 
     def test_no_match_anywhere_is_a_message_error(self):
-        self._use_rofi("fake_rofi_type_other_corp")  # types a term with no entry either
         rc, out, err = self._run("https://portal.example.test/")
         self.assertNotEqual(rc, 0)
         self.assertIn("message-error", self._fifo_contents())
-        # cascade + typed search both fail -> falls through to the
-        # keepassxc-cli database fallback (see LastResortCliFallbackTests),
-        # which here also finds nothing (no database configured, and
-        # fake_home - see setUp - is an empty directory)
+        # The direct CLI fallback also finds nothing: no database is
+        # configured and fake_home is deliberately empty.
         self.assertIn("no KeePassXC database found to search", self._fifo_contents())
 
-    def test_escape_on_search_prompt_cancels(self):
-        self._use_rofi("fake_rofi_cancel")
-        rc, out, err = self._run("https://portal.example.test/")
-        self.assertEqual(rc, 0)
-        self.assertIn("cancelled", self._fifo_contents())
-        self.assertNotIn("jseval", self._fifo_contents())
-
-    def test_search_prompt_prefilled_with_registrable_domain(self):
-        # can't observe rofi's actual UI, but a recording fake rofi can
-        # capture exactly what -filter value prompt_search_term used.
+    def test_no_match_does_not_prompt_for_a_site_term(self):
         record_file = self._use_filter_recorder_rofi()
         rc, out, err = self._run("https://checkout.shop.example.test/cart")
-        self.assertEqual(record_file.read_text().splitlines(), ["example.test"])
+        self.assertNotEqual(rc, 0)
+        self.assertFalse(record_file.exists())
 
 
 class ForgetTests(LoginFlowTestCase):
@@ -355,17 +325,15 @@ class ForgetTests(LoginFlowTestCase):
         self.assertEqual(rc, 0, err)
         self.assertEqual(self.server.saved_logins, [])
 
-    def test_after_forget_the_search_prompt_is_needed_again(self):
+    def test_after_forget_a_protocol_miss_goes_to_cli_fallback(self):
         self._seed_entry("https://other-corp.example/", "alice", password="hunter2")
         kl.save_alias("portal.example.test", "other-corp.example")
         self._run("https://portal.example.test/", extra_argv=["--forget"])
-        # a recording fake rofi proves the search prompt genuinely ran
-        # again (not skipped via the now-forgotten alias) - it's asked for
-        # the registrable-domain default "example.test", which doesn't
-        # match the seeded "other-corp.example" entry.
         record_file = self._use_filter_recorder_rofi()
         rc, out, err = self._run("https://portal.example.test/")
-        self.assertEqual(record_file.read_text().splitlines(), ["example.test"])
+        self.assertNotEqual(rc, 0)
+        self.assertFalse(record_file.exists())
+        self.assertIn("no KeePassXC database found", self._fifo_contents())
         self.assertIsNone(kl.get_alias("portal.example.test"))
 
 

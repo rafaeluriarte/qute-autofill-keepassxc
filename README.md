@@ -1,9 +1,9 @@
 # qute-autofill-keepassxc
 
-Two [qutebrowser](https://qutebrowser.org) userscripts:
+A small set of [qutebrowser](https://qutebrowser.org) userscripts:
 
 * **autofill** fills address and contact forms in **Italian, Portuguese (PT and BR) and English** from a local profile file.
-* **keepassxc-login / keepassxc-newpass** make KeePassXC logins easier: a lookup that still finds your entry when you are not on the exact page it was saved from, and a one-key "generate a password, store it in KeePassXC, then fill it".
+* **keepassxc-login / keepassxc-newpass / keepassxc-save** make KeePassXC logins easier: lookup and fill, generate-save-fill, and save credentials already typed into a page.
 
 Everything runs in qutebrowser's isolated JavaScript world, so websites cannot read your profile. Nothing is ever submitted for you.
 
@@ -32,18 +32,17 @@ KeePassXC only matches a saved entry to a page when the entry's URL is the same 
 2. the exact page URL,
 3. the site root, and the other scheme (http/https),
 4. parent domains, with and without `www`,
-5. common login subdomains (`accounts.`, `login.`, `auth.`, `id.`, `sso.`, ...),
-6. and finally asks, via rofi, which site to search.
+5. and common login subdomains (`accounts.`, `login.`, `auth.`, `id.`, `sso.`, ...).
 
 Whatever works is remembered for next time (`--forget` clears it). Several matches are shown in a rofi list (login, title, URL, never a password). `--totp` fills a TOTP code instead.
 
-If even that finds nothing, because the entry has **no URL at all**, or lives in a database that is not currently open in KeePassXC, the script falls back to searching the database *file* with `keepassxc-cli`:
+If that finds nothing, because the entry has **no matching URL**, or lives in a database that is not currently open in KeePassXC, the script falls back to reading the database *file* with `keepassxc-cli`:
 
 * it uses your configured database (a rofi picker only if there are several),
 * asks for the master password with rofi (passed to `keepassxc-cli` on stdin only: never on the command line, in an environment variable, in a file, or in any log),
-* one prompt doubles as search box and result list, pre-filled with the site name; entries **without a URL are listed like any other**, because the search goes by title and username,
+* it enumerates every entry and shows **title, username, and URL** in one `rofi -dmenu -i` list, so normal rofi typing live-filters the entire database; entries without a URL are included,
 * fills the entry you pick,
-* then offers (defaulting to yes) to write the page's URL into that entry, so the fast path works next time. KeePassXC's window may ask to reload the database afterwards, because the file changed on disk.
+* then offers (defaulting to Yes) to write the current origin into that entry, even when it previously had a different URL, so the fast path works next time. It also remembers the host-to-entry choice. KeePassXC's window may ask to reload the database afterwards, because the file changed on disk.
 
 Databases and the per-site choices are remembered in `~/.config/qutebrowser/keepassxc-login.toml` (no secrets). `--cli` goes straight to this path.
 
@@ -54,12 +53,30 @@ Databases and the per-site choices are remembered in `~/.config/qutebrowser/keep
 3. **Saves it to KeePassXC first.** On a change-password form it updates the existing entry (KeePassXC keeps the old password in the entry history); on a sign-up form with an existing login it asks whether to update or create.
 4. Only after a confirmed save does it fill the new-password and confirm fields. There is no mode that fills a password without storing it.
 
+### keepassxc-save (`ps`)
+
+Use this after typing a username and password into a site's login form:
+
+1. Press `ps`. The form is read in qutebrowser's isolated `jseval` world.
+2. Rofi asks **“Save password for &lt;domain&gt;?”** with Yes selected by default.
+3. On Yes, the entry is created with the current origin as its URL. If the site already has an entry, it is updated; a differing username requires an additional confirmation.
+
+The capture program goes to qutebrowser through its FIFO, but the password does not: the page returns the two values to a one-shot, loopback-only listener with an unguessable path. Values stay in memory and are never put in a file, command argument, environment variable, qutebrowser message, or log.
+
+Suggested binding (chosen not to collide with this repo's `pw`, `pT`, `pn`, `pf`, `pF`, or `pu` bindings):
+
+```python
+config.bind('ps', 'spawn --userscript keepassxc-save --key 57CD7E3CFB413065', mode='normal')
+```
+
+Automatic prompting after submit is deliberately not installed. A normal qutebrowser userscript cannot observe every later submission and receive isolated-world values without a persistent local credential receiver or browser modification. The manual `ps` flow is explicit, works before navigation destroys the form, and avoids broad always-on credential capture.
+
 ## Requirements
 
 * qutebrowser 3.x (tested on 3.7 with QtWebEngine 6.11)
 * Python 3.11+ (`tomllib`)
-* [qute-keepassxc](https://github.com/MB-Tech/qute-keepassxc) by Markus Blöchl for the KeePassXC scripts: they reuse its protocol client and its existing association, so `pw` keeps working as before. Install it in the same userscripts directory, or point `$QUTE_KEEPASSXC` at it.
-* KeePassXC 2.7+ with browser integration enabled, plus `keepassxc-cli` for password generation
+* [qute-keepassxc](https://github.com/MB-Tech/qute-keepassxc) by Markus Blöchl for the KeePassXC scripts: they reuse its protocol client and its existing association. Install it in the same userscripts directory, or point `$QUTE_KEEPASSXC` at it. Use the same `--key` value for `pw`, `pT`, `pn`, and `ps`.
+* KeePassXC 2.7+ with browser integration enabled, plus `keepassxc-cli` for password generation and the all-entry fallback
 * `rofi` for the pickers
 * `python-pynacl` for the KeePassXC protocol, `tomlkit` for the lookup config file
 * optional: `node` + `jsdom` for the missed-field report and the test suite
@@ -81,7 +98,7 @@ Then put your data in `~/.config/qutebrowser/autofill/profiles.toml` (the file i
 * Nothing is written to disk while filling: no temporary file with your data.
 * The missed-field log stores field labels only, never values.
 * Remembered KeePassXC sites are host names only, no credentials.
-* Passwords never appear in qutebrowser messages, logs or rofi.
+* Passwords never appear in qutebrowser messages, logs or rofi. The `ps` capture is memory-only.
 
 ## Tests
 
