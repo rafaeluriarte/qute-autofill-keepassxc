@@ -92,6 +92,8 @@ def parse_args(argv=None):
     parser.add_argument("url", nargs="?", default=os.environ.get("QUTE_URL"))
     parser.add_argument("--totp", action="store_true",
                          help="fill the current TOTP field instead of username/password")
+    parser.add_argument("--submit", action="store_true",
+                         help="submit the login after filling it (opt-in; intended for the pW binding)")
     parser.add_argument("--forget", action="store_true",
                          help="forget the remembered alias/CLI database mapping for this page's host and exit")
     parser.add_argument("--cli", action="store_true",
@@ -427,7 +429,8 @@ def _cli_list_and_pick(cli_path, db, password):
     return prompt_all_entries(entries), None
 
 
-def _cli_show_and_fill(cli_path, db, password, entry_path, totp_mode, page_url, host, doc, already_remembered):
+def _cli_show_and_fill(cli_path, db, password, entry_path, totp_mode, page_url, host, doc,
+                       already_remembered, submit=False):
     """Read the selected entry, fill it, offer URL repair (default Yes),
     and update the config's remembered mapping.
     """
@@ -469,7 +472,9 @@ def _cli_show_and_fill(cli_path, db, password, entry_path, totp_mode, page_url, 
         kl.message_error("keepassxc-login: entry has no username/password to fill")
         return 1
 
-    kl.fifo_send(f"jseval --quiet --world jseval {build_login_fill_js(login, entry_password)}")
+    kl.fifo_send(
+        f"jseval --quiet --world jseval {build_login_fill_js(login, entry_password, submit=submit)}"
+    )
     kl.message_info(f"keepassxc: filled from the database ({entry_path})")
 
     origin = _origin_of(page_url)
@@ -494,7 +499,7 @@ def _cli_show_and_fill(cli_path, db, password, entry_path, totp_mode, page_url, 
     return 0
 
 
-def cli_fallback(host, page_url, totp_mode, cli_path):
+def cli_fallback(host, page_url, totp_mode, cli_path, submit=False):
     """The full keepassxc-cli database-file fallback (steps 1-7): only
     reached after the browser-protocol cascade finds nothing (or --cli
     forced it directly). Never touches the protocol socket itself.
@@ -508,7 +513,9 @@ def cli_fallback(host, page_url, totp_mode, cli_path):
         if not password:
             kl.message_info("keepassxc-login: cancelled")
             return 0
-        rc = _cli_show_and_fill(cli_path, db, password, entry_path, totp_mode, page_url, host, doc, True)
+        rc = _cli_show_and_fill(
+            cli_path, db, password, entry_path, totp_mode, page_url, host, doc, True, submit=submit,
+        )
         password = None  # best-effort: drop the reference promptly (see section docstring)
         return rc
 
@@ -530,7 +537,9 @@ def cli_fallback(host, page_url, totp_mode, cli_path):
         kl.message_info("keepassxc-login: cancelled")
         return 0
 
-    rc = _cli_show_and_fill(cli_path, db, password, entry_path, totp_mode, page_url, host, doc, False)
+    rc = _cli_show_and_fill(
+        cli_path, db, password, entry_path, totp_mode, page_url, host, doc, False, submit=submit,
+    )
     password = None
     return rc
 
@@ -543,7 +552,7 @@ def _dump(obj) -> str:
     return kl._dump_one_line(obj)
 
 
-def build_login_fill_js(login: str, password: str) -> str:
+def build_login_fill_js(login: str, password: str, submit: bool = False) -> str:
     """Fill a conventional or two-step login form.
 
     A form containing a password field remains the preferred target: every
@@ -557,7 +566,9 @@ def build_login_fill_js(login: str, password: str) -> str:
     Values are assigned with the native property setter (so frameworks whose
     inputs hook their own setter still observe the change) followed by
     bubbling input/change events, the same technique as keepassxc-newpass's
-    ``build_fill_js``.
+    ``build_fill_js``. Submission is strictly opt-in: ``submit=True`` uses
+    ``requestSubmit()`` for a real form or clicks a visible, login-labelled
+    control near a form-less password input.
     """
     template = """
         (function () {
@@ -579,6 +590,40 @@ def build_login_fill_js(login: str, password: str) -> str:
                 el.dispatchEvent(new Event("input", { bubbles: true }));
                 el.dispatchEvent(new Event("change", { bubbles: true }));
             }
+            function submitForm(form) {
+                if (!SHOULD_SUBMIT || !form) return false;
+                if (typeof form.requestSubmit === "function") {
+                    form.requestSubmit();
+                    return true;
+                }
+                var button = form.querySelector('button[type="submit"],input[type="submit"]');
+                if (button && isVisible(button) && !button.disabled) {
+                    button.click();
+                    return true;
+                }
+                return false;
+            }
+            function controlLabel(control) {
+                return [control.textContent || "", control.value || "",
+                    control.getAttribute("aria-label") || "", control.title || ""]
+                    .join(" ").replace(/\\s+/g, " ").trim();
+            }
+            function clickNearbyLoginControl(anchor) {
+                if (!SHOULD_SUBMIT || !anchor) return false;
+                var labelPattern = /(^|\\s)(log\\s*in|login|sign\\s*in|continue|next|accedi|anmelden)(\\s|$)/i;
+                for (var scope = anchor.parentElement; scope; scope = scope.parentElement) {
+                    var controls = scope.querySelectorAll('button,input[type="submit"],input[type="button"]');
+                    for (var b = 0; b < controls.length; b++) {
+                        var control = controls[b];
+                        if (!isVisible(control) || control.disabled) continue;
+                        if (labelPattern.test(controlLabel(control))) {
+                            control.click();
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            }
             function hasPasswordField(form) {
                 var inputs = form.getElementsByTagName("input");
                 for (var i = 0; i < inputs.length; i++) {
@@ -599,6 +644,7 @@ def build_login_fill_js(login: str, password: str) -> str:
             }
             var LOGIN = %s;
             var PASSWORD = %s;
+            var SHOULD_SUBMIT = %s;
             var forms = document.getElementsByTagName("form");
             var form = null;
             for (var i = 0; i < forms.length; i++) {
@@ -615,6 +661,7 @@ def build_login_fill_js(login: str, password: str) -> str:
                 }
                 if (hasVisiblePassword) {
                     var filledLooseLogin = false, filledLoosePassword = false;
+                    var passwordAnchor = null;
                     for (var n = 0; n < candidates.length; n++) {
                         var looseInput = candidates[n];
                         if (isLoginInput(looseInput)) {
@@ -623,10 +670,13 @@ def build_login_fill_js(login: str, password: str) -> str:
                         } else if (looseInput.type === "password" && isVisible(looseInput)) {
                             setVal(looseInput, PASSWORD);
                             filledLoosePassword = true;
+                            if (!passwordAnchor) passwordAnchor = looseInput;
                         }
                     }
+                    var submittedLoose = clickNearbyLoginControl(passwordAnchor);
                     return "keepassxc-login: filled" + (filledLooseLogin ? " login" : "")
-                        + (filledLoosePassword ? " password" : "");
+                        + (filledLoosePassword ? " password" : "")
+                        + (submittedLoose ? " and submitted" : "");
                 }
                 var active = document.activeElement;
                 var usernameInput = isLoginInput(active) ? active : null;
@@ -639,7 +689,10 @@ def build_login_fill_js(login: str, password: str) -> str:
                     return "keepassxc-login: no login form found, nothing filled";
                 }
                 setVal(usernameInput, LOGIN);
-                return "keepassxc-login: filled login";
+                var submittedUsername = usernameInput.form
+                    ? submitForm(usernameInput.form)
+                    : clickNearbyLoginControl(usernameInput);
+                return "keepassxc-login: filled login" + (submittedUsername ? " and submitted" : "");
             }
             var inputs = form.getElementsByTagName("input");
             var filledLogin = false, filledPassword = false;
@@ -654,10 +707,12 @@ def build_login_fill_js(login: str, password: str) -> str:
                     filledPassword = true;
                 }
             }
-            return "keepassxc-login: filled" + (filledLogin ? " login" : "") + (filledPassword ? " password" : "");
+            var submittedForm = (filledLogin || filledPassword) ? submitForm(form) : false;
+            return "keepassxc-login: filled" + (filledLogin ? " login" : "")
+                + (filledPassword ? " password" : "") + (submittedForm ? " and submitted" : "");
         })()
     """
-    return " ".join(template.splitlines()) % (_dump(login), _dump(password))
+    return " ".join(template.splitlines()) % (_dump(login), _dump(password), _dump(bool(submit)))
 
 
 def build_totp_fill_js(totp: str) -> str:
@@ -713,7 +768,7 @@ def main(argv=None):
     if args.cli:
         # Skip the browser-protocol lookup entirely (never even connects
         # to the socket) and go straight to the keepassxc-cli fallback.
-        return cli_fallback(host, args.url, args.totp, args.cli_path)
+        return cli_fallback(host, args.url, args.totp, args.cli_path, submit=args.submit)
 
     qkpxc = kl.load_qute_keepassxc()
     ns = SimpleNamespace(key=(None if args.insecure else args.key), insecure=args.insecure, socket=args.socket)
@@ -749,7 +804,7 @@ def main(argv=None):
         # the configured database file and present *all* entries in one
         # live-filterable rofi list; do not make the user guess a site
         # name first.
-        return cli_fallback(host, args.url, args.totp, args.cli_path)
+        return cli_fallback(host, args.url, args.totp, args.cli_path, submit=args.submit)
 
     entry = select_entry(entries)
     if not entry:
@@ -768,7 +823,9 @@ def main(argv=None):
         if not login or not password:
             kl.message_error("keepassxc-login: entry has no login/password to fill")
             return 1
-        kl.fifo_send(f"jseval --quiet --world jseval {build_login_fill_js(login, password)}")
+        kl.fifo_send(
+            f"jseval --quiet --world jseval {build_login_fill_js(login, password, submit=args.submit)}"
+        )
 
     if guessed_host:
         kl.message_info(f"keepassxc: matched {guessed_host}")

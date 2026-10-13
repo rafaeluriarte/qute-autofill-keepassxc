@@ -23,6 +23,7 @@ Add to ~/.config/qutebrowser/config.py (then run :config-source):
   config.bind('pF', 'spawn --userscript autofill --choose', mode='normal')
   config.bind('pu', 'spawn --userscript autofill --undo', mode='normal')
   config.bind('pw', 'spawn --userscript keepassxc-login --key YOUR_GPG_KEY_ID', mode='normal')
+  config.bind('pW', 'spawn --userscript keepassxc-login --key YOUR_GPG_KEY_ID --submit', mode='normal')
   config.bind('pT', 'spawn --userscript keepassxc-login --key YOUR_GPG_KEY_ID --totp', mode='normal')
   config.bind('pn', 'spawn --userscript keepassxc-newpass --key YOUR_GPG_KEY_ID', mode='normal')
   config.bind('ps', 'spawn --userscript keepassxc-save --key YOUR_GPG_KEY_ID', mode='normal')

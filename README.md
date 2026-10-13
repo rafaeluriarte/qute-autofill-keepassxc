@@ -5,7 +5,7 @@ A small set of [qutebrowser](https://qutebrowser.org) userscripts:
 * **autofill** fills address and contact forms in **Italian, Portuguese (PT and BR) and English** from a local profile file.
 * **keepassxc-login / keepassxc-newpass / keepassxc-save** make KeePassXC logins easier: lookup and fill, generate-save-fill, and save credentials already typed into a page.
 
-Everything runs in qutebrowser's isolated JavaScript world, so websites cannot read your profile. Nothing is ever submitted for you.
+Everything runs in qutebrowser's isolated JavaScript world, so websites cannot read your profile. Nothing is submitted unless you explicitly use the `pW` fill-and-submit binding.
 
 ## Features
 
@@ -24,7 +24,7 @@ Everything runs in qutebrowser's isolated JavaScript world, so websites cannot r
 * Per-site rules in the profile file: which profile to use, which fields to skip.
 * Logs the **labels** of fields it could not classify (never values) so the keyword lists can be improved: `autofill --misses` writes a report and opens it.
 
-### keepassxc-login (`pw`, `pT`)
+### keepassxc-login (`pw`, `pW`, `pT`)
 
 KeePassXC only matches a saved entry to a page when the entry's URL is the same host or a **parent** of it, so an entry saved on `accounts.example.com` is invisible from `www.example.com`. This script therefore tries, in order:
 
@@ -36,7 +36,12 @@ KeePassXC only matches a saved entry to a page when the entry's URL is the same 
 
 Whatever works is remembered for next time (`--forget` clears it). Several matches are shown in a rofi list (login, title, URL, never a password). `--totp` fills a TOTP code instead.
 
-Two-step login pages are supported: if the first page contains only a username/email field, `pw` fills only that field and never submits it. Run `pw` again on the password step to fill the password. Form-less login controls used by SPAs are supported too.
+`pw` only fills. `pW` opts into filling and submitting: it uses normal validated form submission when a form exists, or clicks a visible login-labelled button near form-less SPA controls. Two-step pages are supported: use either key again on the next step. Form-less login controls used by SPAs are supported too.
+
+```python
+config.bind('pw', 'spawn --userscript keepassxc-login --key 57CD7E3CFB413065', mode='normal')
+config.bind('pW', 'spawn --userscript keepassxc-login --key 57CD7E3CFB413065 --submit', mode='normal')
+```
 
 If that finds nothing, because the entry has **no matching URL**, or lives in a database that is not currently open in KeePassXC, the script falls back to reading the database *file* with `keepassxc-cli`:
 
@@ -77,7 +82,7 @@ Automatic prompting after submit is deliberately not installed. A normal qutebro
 
 * qutebrowser 3.x (tested on 3.7 with QtWebEngine 6.11)
 * Python 3.11+ (`tomllib`)
-* [qute-keepassxc](https://github.com/MB-Tech/qute-keepassxc) by Markus Blöchl for the KeePassXC scripts: they reuse its protocol client and its existing association. Install it in the same userscripts directory, or point `$QUTE_KEEPASSXC` at it. Use the same `--key` value for `pw`, `pT`, `pn`, and `ps`.
+* [qute-keepassxc](https://github.com/MB-Tech/qute-keepassxc) by Markus Blöchl for the KeePassXC scripts: they reuse its protocol client and its existing association. Install it in the same userscripts directory, or point `$QUTE_KEEPASSXC` at it. Use the same `--key` value for `pw`, `pW`, `pT`, `pn`, and `ps`.
 * KeePassXC 2.7+ with browser integration enabled, plus `keepassxc-cli` for password generation and the all-entry fallback
 * `rofi` for the pickers
 * `python-pynacl` for the KeePassXC protocol, `tomlkit` for the lookup config file

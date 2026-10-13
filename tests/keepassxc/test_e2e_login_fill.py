@@ -121,7 +121,8 @@ class E2ELoginFillTests(unittest.TestCase):
         }
         js = (
             "JSON.stringify([document.querySelector('input[type=email]').value,"
-            "document.querySelector('input[type=password]').value])"
+            "document.querySelector('input[type=password]').value,"
+            "document.body.dataset.submitted || 'no'])"
         )
         proc = self._run_qutebrowser(
             basedir, "login.html", [],
@@ -130,9 +131,35 @@ class E2ELoginFillTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         info_lines = _extract_info_lines(proc.stdout + proc.stderr)
         self.assertTrue(info_lines, proc.stdout + proc.stderr)
-        email_field, password_field = json.loads(info_lines[-1])
+        email_field, password_field, submitted = json.loads(info_lines[-1])
         self.assertEqual(email_field, "alice")
         self.assertEqual(password_field, "hunter2-e2e")
+        self.assertEqual(submitted, "no")
+
+    def test_submit_flag_fills_and_submits_a_real_form(self):
+        entry_uuid = "e2e-submit-form-1"
+        basedir = self._basedir("login-submit")
+        page_host = f"127.0.0.1:{self.http_port}"
+        self.mock_server.entries[entry_uuid] = {
+            "uuid": entry_uuid, "login": "alice@example.test", "password": "submit-test-secret",
+            "url": f"http://{page_host}/", "name": "submit entry",
+        }
+        js = (
+            "JSON.stringify([document.querySelector('input[type=email]').value,"
+            "document.querySelector('input[type=password]').value,"
+            "document.body.dataset.submitted || 'no'])"
+        )
+        proc = self._run_qutebrowser(
+            basedir, "login.html", ["--submit"],
+            [f":later 4000 jseval --world jseval {js}"],
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        info_lines = _extract_info_lines(proc.stdout + proc.stderr)
+        self.assertTrue(info_lines, proc.stdout + proc.stderr)
+        login, password, submitted = json.loads(info_lines[-1])
+        self.assertEqual(login, "alice@example.test")
+        self.assertEqual(password, "submit-test-secret")
+        self.assertEqual(submitted, "yes")
 
     def test_username_only_first_step_gets_login_without_exposing_password(self):
         """Two-step sites such as MPCDF first render only the username.
@@ -187,6 +214,31 @@ class E2ELoginFillTests(unittest.TestCase):
         login, password = json.loads(info_lines[-1])
         self.assertEqual(login, "alice")
         self.assertEqual(password, "formless-test-secret")
+
+    def test_submit_flag_clicks_a_formless_spa_login_button(self):
+        entry_uuid = "e2e-submit-formless-1"
+        basedir = self._basedir("formless-submit")
+        page_host = f"127.0.0.1:{self.http_port}"
+        self.mock_server.entries[entry_uuid] = {
+            "uuid": entry_uuid, "login": "alice", "password": "submit-test-secret",
+            "url": f"http://{page_host}/", "name": "formless submit entry",
+        }
+        js = (
+            "JSON.stringify([document.querySelector('input[type=text]').value,"
+            "document.querySelector('input[type=password]').value,"
+            "document.body.dataset.submitted || 'no'])"
+        )
+        proc = self._run_qutebrowser(
+            basedir, "formless-login.html", ["--submit"],
+            [f":later 4000 jseval --world jseval {js}"],
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        info_lines = _extract_info_lines(proc.stdout + proc.stderr)
+        self.assertTrue(info_lines, proc.stdout + proc.stderr)
+        login, password, submitted = json.loads(info_lines[-1])
+        self.assertEqual(login, "alice")
+        self.assertEqual(password, "submit-test-secret")
+        self.assertEqual(submitted, "yes")
 
     def test_totp_fills_the_focused_input(self):
         entry_uuid = "e2e-totp-1"

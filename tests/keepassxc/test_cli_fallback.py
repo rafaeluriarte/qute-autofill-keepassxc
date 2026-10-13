@@ -187,6 +187,14 @@ class SingleDatabaseNoUrlEntryTests(CliFallbackTestCase):
         self.assertIn("jseval --quiet --world jseval", fifo)
         self.assertIn("getOwnPropertyDescriptor", fifo)  # native setter, same as the protocol path
 
+    def test_submit_flag_reaches_the_cli_fallback_fill(self):
+        self._queue_answers(MASTER_PASSWORD, "/Ticketshop.example account")
+        rc, out, err = self._run(
+            "https://ticketshop.example/", extra_argv=["--cli", "--submit"],
+        )
+        self.assertEqual(rc, 0, err)
+        self.assertIn("var SHOULD_SUBMIT = true", self._fifo_contents())
+
     def test_password_never_in_argv(self):
         # structural guarantee, independent of any particular flow: patch
         # subprocess.run and confirm the password string is never one of
