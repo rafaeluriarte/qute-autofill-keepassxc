@@ -544,12 +544,19 @@ def _dump(obj) -> str:
 
 
 def build_login_fill_js(login: str, password: str) -> str:
-    """Fill the first form with a password field: every visible text/email
-    input in it gets `login`, every password input gets `password` - same
-    field selection as qute-keepassxc's own `make_js_code`, but using a
-    native property setter (so frameworks whose inputs hook their own
-    setter still observe the change) with bubbling input/change events,
-    same technique as keepassxc-newpass's `build_fill_js`.
+    """Fill a conventional or two-step login form.
+
+    A form containing a password field remains the preferred target: every
+    visible text/email input in it gets ``login`` and every visible password
+    input gets ``password``. If the page is the username-only first step of a
+    two-step login, fill only a plausible visible username/email control and
+    never submit. This keeps the password out of the page DOM until a real
+    password control exists.
+
+    Values are assigned with the native property setter (so frameworks whose
+    inputs hook their own setter still observe the change) followed by
+    bubbling input/change events, the same technique as keepassxc-newpass's
+    ``build_fill_js``.
     """
     template = """
         (function () {
@@ -578,6 +585,16 @@ def build_login_fill_js(login: str, password: str) -> str:
                 }
                 return false;
             }
+            function isLoginInput(input) {
+                if (!input || !isVisible(input)) return false;
+                if (input.type !== "text" && input.type !== "email") return false;
+                if (input.type === "email") return true;
+                var autocomplete = (input.getAttribute("autocomplete") || "").toLowerCase();
+                if (autocomplete.split(/\\s+/).indexOf("username") !== -1) return true;
+                var identity = [input.name || "", input.id || "", input.getAttribute("aria-label") || ""]
+                    .join(" ").toLowerCase();
+                return /(^|[^a-z])(user(name)?|login|email|account|identifier|user[-_]?id)([^a-z]|$)/.test(identity);
+            }
             var LOGIN = %s;
             var PASSWORD = %s;
             var forms = document.getElementsByTagName("form");
@@ -586,7 +603,19 @@ def build_login_fill_js(login: str, password: str) -> str:
                 if (hasPasswordField(forms[i])) { form = forms[i]; break; }
             }
             if (!form) {
-                return "keepassxc-login: no form with a password field found, nothing filled";
+                var active = document.activeElement;
+                var usernameInput = isLoginInput(active) ? active : null;
+                if (!usernameInput) {
+                    var candidates = document.getElementsByTagName("input");
+                    for (var c = 0; c < candidates.length; c++) {
+                        if (isLoginInput(candidates[c])) { usernameInput = candidates[c]; break; }
+                    }
+                }
+                if (!usernameInput) {
+                    return "keepassxc-login: no login form found, nothing filled";
+                }
+                setVal(usernameInput, LOGIN);
+                return "keepassxc-login: filled login";
             }
             var inputs = form.getElementsByTagName("input");
             var filledLogin = false, filledPassword = false;

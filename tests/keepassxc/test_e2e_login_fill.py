@@ -134,6 +134,37 @@ class E2ELoginFillTests(unittest.TestCase):
         self.assertEqual(email_field, "alice")
         self.assertEqual(password_field, "hunter2-e2e")
 
+    def test_username_only_first_step_gets_login_without_exposing_password(self):
+        """Two-step sites such as MPCDF first render only the username.
+
+        The login must be filled even though no password control exists yet;
+        the password must stay inside the userscript until a later page offers
+        an actual password field.
+        """
+        entry_uuid = "e2e-two-step-1"
+        basedir = self._basedir("username-only")
+        page_host = f"127.0.0.1:{self.http_port}"
+        self.mock_server.entries[entry_uuid] = {
+            "uuid": entry_uuid, "login": "alice", "password": "never-render-this",
+            "url": f"http://{page_host}/", "name": "two-step entry",
+        }
+        js = (
+            "JSON.stringify([document.getElementById('username').value,"
+            "document.querySelectorAll('input[type=password]').length,"
+            "document.forms[0].dataset.submitted || 'no'])"
+        )
+        proc = self._run_qutebrowser(
+            basedir, "username-only.html", [],
+            [f":later 4000 jseval --world jseval {js}"],
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        info_lines = _extract_info_lines(proc.stdout + proc.stderr)
+        self.assertTrue(info_lines, proc.stdout + proc.stderr)
+        username, password_field_count, submitted = json.loads(info_lines[-1])
+        self.assertEqual(username, "alice")
+        self.assertEqual(password_field_count, 0)
+        self.assertEqual(submitted, "no")
+
     def test_totp_fills_the_focused_input(self):
         entry_uuid = "e2e-totp-1"
         basedir = self._basedir("totp")
