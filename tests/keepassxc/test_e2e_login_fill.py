@@ -165,6 +165,29 @@ class E2ELoginFillTests(unittest.TestCase):
         self.assertEqual(password_field_count, 0)
         self.assertEqual(submitted, "no")
 
+    def test_formless_spa_login_controls_are_filled(self):
+        """Nuxt/Vue login controls need not be enclosed by a form element."""
+        entry_uuid = "e2e-formless-1"
+        basedir = self._basedir("formless-login")
+        page_host = f"127.0.0.1:{self.http_port}"
+        self.mock_server.entries[entry_uuid] = {
+            "uuid": entry_uuid, "login": "alice", "password": "formless-test-secret",
+            "url": f"http://{page_host}/", "name": "formless entry",
+        }
+        js = (
+            "JSON.stringify(Array.from(document.querySelectorAll('input')).map(function(e){return e.value}))"
+        )
+        proc = self._run_qutebrowser(
+            basedir, "formless-login.html", [],
+            [f":later 4000 jseval --world jseval {js}"],
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        info_lines = _extract_info_lines(proc.stdout + proc.stderr)
+        self.assertTrue(info_lines, proc.stdout + proc.stderr)
+        login, password = json.loads(info_lines[-1])
+        self.assertEqual(login, "alice")
+        self.assertEqual(password, "formless-test-secret")
+
     def test_totp_fills_the_focused_input(self):
         entry_uuid = "e2e-totp-1"
         basedir = self._basedir("totp")

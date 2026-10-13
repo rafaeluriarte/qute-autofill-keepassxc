@@ -548,9 +548,10 @@ def build_login_fill_js(login: str, password: str) -> str:
 
     A form containing a password field remains the preferred target: every
     visible text/email input in it gets ``login`` and every visible password
-    input gets ``password``. If the page is the username-only first step of a
-    two-step login, fill only a plausible visible username/email control and
-    never submit. This keeps the password out of the page DOM until a real
+    input gets ``password``. Form-less SPA controls are supported by pairing
+    visible password inputs with plausible username/email inputs. If the page
+    is the username-only first step of a two-step login, fill only that field
+    and never submit. This keeps the password out of the page DOM until a real
     password control exists.
 
     Values are assigned with the native property setter (so frameworks whose
@@ -591,7 +592,8 @@ def build_login_fill_js(login: str, password: str) -> str:
                 if (input.type === "email") return true;
                 var autocomplete = (input.getAttribute("autocomplete") || "").toLowerCase();
                 if (autocomplete.split(/\\s+/).indexOf("username") !== -1) return true;
-                var identity = [input.name || "", input.id || "", input.getAttribute("aria-label") || ""]
+                var identity = [input.name || "", input.id || "", input.placeholder || "",
+                    input.getAttribute("aria-label") || ""]
                     .join(" ").toLowerCase();
                 return /(^|[^a-z])(user(name)?|login|email|account|identifier|user[-_]?id)([^a-z]|$)/.test(identity);
             }
@@ -603,10 +605,32 @@ def build_login_fill_js(login: str, password: str) -> str:
                 if (hasPasswordField(forms[i])) { form = forms[i]; break; }
             }
             if (!form) {
+                var candidates = document.getElementsByTagName("input");
+                var hasVisiblePassword = false;
+                for (var p = 0; p < candidates.length; p++) {
+                    if (candidates[p].type === "password" && isVisible(candidates[p])) {
+                        hasVisiblePassword = true;
+                        break;
+                    }
+                }
+                if (hasVisiblePassword) {
+                    var filledLooseLogin = false, filledLoosePassword = false;
+                    for (var n = 0; n < candidates.length; n++) {
+                        var looseInput = candidates[n];
+                        if (isLoginInput(looseInput)) {
+                            setVal(looseInput, LOGIN);
+                            filledLooseLogin = true;
+                        } else if (looseInput.type === "password" && isVisible(looseInput)) {
+                            setVal(looseInput, PASSWORD);
+                            filledLoosePassword = true;
+                        }
+                    }
+                    return "keepassxc-login: filled" + (filledLooseLogin ? " login" : "")
+                        + (filledLoosePassword ? " password" : "");
+                }
                 var active = document.activeElement;
                 var usernameInput = isLoginInput(active) ? active : null;
                 if (!usernameInput) {
-                    var candidates = document.getElementsByTagName("input");
                     for (var c = 0; c < candidates.length; c++) {
                         if (isLoginInput(candidates[c])) { usernameInput = candidates[c]; break; }
                     }

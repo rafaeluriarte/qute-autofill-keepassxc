@@ -36,7 +36,7 @@ KeePassXC only matches a saved entry to a page when the entry's URL is the same 
 
 Whatever works is remembered for next time (`--forget` clears it). Several matches are shown in a rofi list (login, title, URL, never a password). `--totp` fills a TOTP code instead.
 
-Two-step login pages are supported: if the first page contains only a username/email field, `pw` fills only that field and never submits it. Run `pw` again on the password step to fill the password.
+Two-step login pages are supported: if the first page contains only a username/email field, `pw` fills only that field and never submits it. Run `pw` again on the password step to fill the password. Form-less login controls used by SPAs are supported too.
 
 If that finds nothing, because the entry has **no matching URL**, or lives in a database that is not currently open in KeePassXC, the script falls back to reading the database *file* with `keepassxc-cli`:
 
